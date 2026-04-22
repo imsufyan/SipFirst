@@ -1,0 +1,7 @@
+{
+  "platforms": ["apple"],
+  "apple": {
+    "modules": ["SipFirstScreenTimeModule"],
+    "podspecPath": "ios/SipFirstScreenTime.podspec"
+  }
+}
