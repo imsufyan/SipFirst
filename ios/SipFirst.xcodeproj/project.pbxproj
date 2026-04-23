@@ -16,6 +16,8 @@
 		52A88C8E2F914FC1002C2962 /* SipFirstShieldActionExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 52A88C842F914FC1002C2962 /* SipFirstShieldActionExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		52A88C9A2F915052002C2962 /* DeviceActivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52A88C992F915052002C2962 /* DeviceActivity.framework */; };
 		52A88CA22F915052002C2962 /* SipFirstDeviceActivityMonitor.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 52A88C982F915052002C2962 /* SipFirstDeviceActivityMonitor.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		52A88D122F98F03A002C2962 /* SipFirstVisionModuleBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 52A88D102F98F03A002C2962 /* SipFirstVisionModuleBridge.m */; };
+		52A88D2A2F9A47FA002C2962 /* SipFirstVisionModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52A88D292F9A47FA002C2962 /* SipFirstVisionModule.swift */; };
 		7C9C47A6E982A27FF5E5675C /* SipFirst/ScreenTimeManagerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = C72EB1D499FDB19E61CA5CC8 /* SipFirst/ScreenTimeManagerBridge.m */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
 		C63FA912E292466A26681422 /* ExpoModulesProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3462F371F717F1253E2F024 /* ExpoModulesProvider.swift */; };
@@ -63,6 +65,8 @@
 		52A88C852F914FC1002C2962 /* ManagedSettings.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ManagedSettings.framework; path = System/Library/Frameworks/ManagedSettings.framework; sourceTree = SDKROOT; };
 		52A88C982F915052002C2962 /* SipFirstDeviceActivityMonitor.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SipFirstDeviceActivityMonitor.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		52A88C992F915052002C2962 /* DeviceActivity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DeviceActivity.framework; path = System/Library/Frameworks/DeviceActivity.framework; sourceTree = SDKROOT; };
+		52A88D102F98F03A002C2962 /* SipFirstVisionModuleBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SipFirstVisionModuleBridge.m; sourceTree = "<group>"; };
+		52A88D292F9A47FA002C2962 /* SipFirstVisionModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SipFirstVisionModule.swift; sourceTree = "<group>"; };
 		74205D1D598BB4A6C969492D /* SipFirst/ScreenTimeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SipFirst/ScreenTimeManager.swift; sourceTree = "<group>"; };
 		8737884B64B479D062A702B1 /* libPods-SipFirst.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-SipFirst.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A3462F371F717F1253E2F024 /* ExpoModulesProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ExpoModulesProvider.swift; path = "Pods/Target Support Files/Pods-SipFirst/ExpoModulesProvider.swift"; sourceTree = "<group>"; };
@@ -129,6 +133,8 @@
 		13B07FAE1A68108700A75B9A /* SipFirst */ = {
 			isa = PBXGroup;
 			children = (
+				52A88D292F9A47FA002C2962 /* SipFirstVisionModule.swift */,
+				52A88D102F98F03A002C2962 /* SipFirstVisionModuleBridge.m */,
 				F11748412D0307B40044C1D9 /* AppDelegate.swift */,
 				74205D1D598BB4A6C969492D /* SipFirst/ScreenTimeManager.swift */,
 				C72EB1D499FDB19E61CA5CC8 /* SipFirst/ScreenTimeManagerBridge.m */,
@@ -487,6 +493,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */,
+				52A88D2A2F9A47FA002C2962 /* SipFirstVisionModule.swift in Sources */,
+				52A88D122F98F03A002C2962 /* SipFirstVisionModuleBridge.m in Sources */,
 				45E6D20D46885B2088A7F8A4 /* SipFirst/ScreenTimeManager.swift in Sources */,
 				7C9C47A6E982A27FF5E5675C /* SipFirst/ScreenTimeManagerBridge.m in Sources */,
 				C63FA912E292466A26681422 /* ExpoModulesProvider.swift in Sources */,
