@@ -293,7 +293,7 @@ class SipFirstVisionModule: NSObject {
           //   5. colScore  > 0.20    — column profile must be non-flat.
           //   Conditions 4–5 prevent a very high satScore (nearly colourless
           //   object) from masking weak transparency and cylindrical-shape signals.
-          let bgScoreMin: Float = 0.75
+          let bgScoreMin: Float = 0.65
           let scoreGatesPass =
             tr.combined > transparencyMinScore &&
             tr.varScore > varScoreMin          &&
@@ -490,7 +490,7 @@ class SipFirstVisionModule: NSObject {
       if ringArea > 0.0001 {
         let ringMean = (outerMean * outerArea - meanL * innerArea) / ringArea
         bgDiff  = abs(meanL - ringMean)
-        bgScore = max(0, min(1, 1.0 - bgDiff / 0.08))
+        bgScore = max(0, min(1, 1.0 - bgDiff / 0.10))
       }
     }
 
@@ -547,7 +547,7 @@ class SipFirstVisionModule: NSObject {
     var hardTag = ""
     if meanL   < 0.08  { hardTag += " [DARK]"    }
     if stdDevL < 0.010 { hardTag += " [UNIFORM]" }
-    if meanS   > 0.45  { hardTag += " [COLORED]" }
+    if meanS   > 0.50  { hardTag += " [COLORED]" }
     if stdDevS > 0.25  { hardTag += " [PATCHY]"  }
 
     if !hardTag.isEmpty {
@@ -682,6 +682,18 @@ class SipFirstVisionModule: NSObject {
   ///   Vision  — origin bottom-left, y upward
   ///   CGImage — origin top-left,    y downward
   ///   → pixY (from top) = imgH × (1 − normRect.maxY)
+  ///
+  /// Memory-safety guarantees:
+  ///   • Crop rect is clamped to valid pixel bounds before calling cropping().
+  ///   • CGContext is created with data:nil — Core Graphics owns and manages
+  ///     the pixel buffer lifetime.
+  ///   • ctx.data pointer is read inside withExtendedLifetime(ctx) so ARC
+  ///     cannot release ctx (and free its buffer) before the loop finishes.
+  ///   • assumingMemoryBound is used instead of bindMemory: we assert the byte
+  ///     layout without rebinding the memory type, which is correct for a
+  ///     Core Graphics-allocated RGBA8 buffer.
+  ///   • UnsafeBufferPointer bounds the read to exactly the allocated region,
+  ///     adding debug-mode index checks.
   private static func sampleRegion(
     cgImage: CGImage,
     normRect: CGRect,
@@ -692,16 +704,27 @@ class SipFirstVisionModule: NSObject {
     let imgW = CGFloat(cgImage.width)
     let imgH = CGFloat(cgImage.height)
 
-    let pixX = normRect.minX * imgW
-    let pixY = (1.0 - normRect.maxY) * imgH
-    let pixW = max(1.0, normRect.width  * imgW)
-    let pixH = max(1.0, normRect.height * imgH)
+    guard imgW > 0, imgH > 0, sampleW > 0, sampleH > 0 else { return [] }
+
+    // Convert Vision normalised coords to CGImage pixel coords, then clamp
+    // to [0, imgW/imgH) so cropping() never receives an out-of-bounds rect.
+    let rawX = normRect.minX * imgW
+    let rawY = (1.0 - normRect.maxY) * imgH
+    let rawW = normRect.width  * imgW
+    let rawH = normRect.height * imgH
+
+    let clampedX = max(0.0, min(rawX, imgW - 1))
+    let clampedY = max(0.0, min(rawY, imgH - 1))
+    let clampedW = max(1.0, min(rawW, imgW - clampedX))
+    let clampedH = max(1.0, min(rawH, imgH - clampedY))
 
     guard let cropped = cgImage.cropping(
-      to: CGRect(x: pixX, y: pixY, width: pixW, height: pixH)
+      to: CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
     ) else { return [] }
 
     let cs = CGColorSpaceCreateDeviceRGB()
+    // data:nil — Core Graphics allocates and owns the backing buffer.
+    // This avoids any external-pointer lifetime issue.
     guard let ctx = CGContext(
       data: nil,
       width: sampleW, height: sampleH,
@@ -711,23 +734,37 @@ class SipFirstVisionModule: NSObject {
     ) else { return [] }
 
     ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
-    guard let raw = ctx.data else { return [] }
 
-    let ptr = raw.bindMemory(to: UInt8.self, capacity: sampleW * sampleH * 4)
+    // withExtendedLifetime(ctx) ensures ARC cannot release ctx — and therefore
+    // free its pixel buffer — before the loop finishes reading every byte.
+    // Without this, the compiler is free to insert a release of ctx immediately
+    // after ctx.data is accessed (its last use), leaving ptr dangling.
+    let totalPixels = sampleW * sampleH
     var result = [PixelSample]()
-    result.reserveCapacity(sampleW * sampleH)
+    result.reserveCapacity(totalPixels)
 
-    for i in 0..<(sampleW * sampleH) {
-      let r = Float(ptr[i * 4 + 0]) / 255.0
-      let g = Float(ptr[i * 4 + 1]) / 255.0
-      let b = Float(ptr[i * 4 + 2]) / 255.0
-      let maxC = max(r, max(g, b))
-      let minC = min(r, min(g, b))
-      result.append(PixelSample(
-        lightness:  (maxC + minC) * 0.5,
-        saturation: maxC > 0.001 ? (maxC - minC) / maxC : 0.0
-      ))
+    withExtendedLifetime(ctx) {
+      guard let raw = ctx.data else { return }
+      // assumingMemoryBound (not bindMemory): we assert the byte type without
+      // rebinding the allocation's type, which is the correct API for an
+      // externally-allocated buffer whose type we know but did not control.
+      let ptr = raw.assumingMemoryBound(to: UInt8.self)
+      let buf = UnsafeBufferPointer(start: ptr, count: totalPixels * 4)
+
+      for i in 0..<totalPixels {
+        let base = i * 4
+        let r = Float(buf[base    ]) / 255.0
+        let g = Float(buf[base + 1]) / 255.0
+        let b = Float(buf[base + 2]) / 255.0
+        let maxC = max(r, max(g, b))
+        let minC = min(r, min(g, b))
+        result.append(PixelSample(
+          lightness:  (maxC + minC) * 0.5,
+          saturation: maxC > 0.001 ? (maxC - minC) / maxC : 0.0
+        ))
+      }
     }
+
     return result
   }
 
