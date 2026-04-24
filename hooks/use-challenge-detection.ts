@@ -7,8 +7,8 @@ const { SipFirstVisionModule } = NativeModules;
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 // How many consecutive successful detections before we call it "stable".
-// At CAPTURE_INTERVAL_MS = 1 000 ms this means ~5 seconds.
-const STABLE_REQUIRED = 5;
+// At CAPTURE_INTERVAL_MS = 500 ms this means ~1.5 seconds.
+const STABLE_REQUIRED = 3;
 
 // How many consecutive missed detections are tolerated before the stable
 // counter resets (hysteresis).  Bumped to 4 because the two-gate glass check
@@ -16,7 +16,7 @@ const STABLE_REQUIRED = 5;
 const MISS_HYSTERESIS = 4;
 
 // Gap between each photo capture + analysis round.
-const CAPTURE_INTERVAL_MS = 1_000;
+const CAPTURE_INTERVAL_MS = 500;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
