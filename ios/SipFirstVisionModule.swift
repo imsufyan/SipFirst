@@ -293,10 +293,12 @@ class SipFirstVisionModule: NSObject {
           //   5. colScore  > 0.20    — column profile must be non-flat.
           //   Conditions 4–5 prevent a very high satScore (nearly colourless
           //   object) from masking weak transparency and cylindrical-shape signals.
+          let bgScoreMin: Float = 0.75
           let scoreGatesPass =
             tr.combined > transparencyMinScore &&
             tr.varScore > varScoreMin          &&
-            tr.colScore > colScoreMin
+            tr.colScore > colScoreMin          &&
+            tr.bgScore  > bgScoreMin
 
           glassDetected = faceDetected && handBelowFace && scoreGatesPass
 
@@ -488,7 +490,7 @@ class SipFirstVisionModule: NSObject {
       if ringArea > 0.0001 {
         let ringMean = (outerMean * outerArea - meanL * innerArea) / ringArea
         bgDiff  = abs(meanL - ringMean)
-        bgScore = max(0, min(1, 1.0 - bgDiff / 0.18))
+        bgScore = max(0, min(1, 1.0 - bgDiff / 0.08))
       }
     }
 
@@ -545,7 +547,7 @@ class SipFirstVisionModule: NSObject {
     var hardTag = ""
     if meanL   < 0.08  { hardTag += " [DARK]"    }
     if stdDevL < 0.010 { hardTag += " [UNIFORM]" }
-    if meanS   > 0.55  { hardTag += " [COLORED]" }
+    if meanS   > 0.45  { hardTag += " [COLORED]" }
     if stdDevS > 0.25  { hardTag += " [PATCHY]"  }
 
     if !hardTag.isEmpty {
