@@ -87,6 +87,15 @@ class SipFirstVisionModule: NSObject {
     let debug:         String  // full numeric calibration line
   }
 
+  private struct LiquidResult {
+    enum Level: String { case empty, low, medium, high, full }
+    let hasLiquid:  Bool
+    let levelNorm:  Float   // 0.0 = empty, 1.0 = full
+    let level:      Level
+    let confidence: Float   // 0.0–1.0
+    let debug:      String
+  }
+
   // MARK: – RN entry point
 
   @objc func analyzeImage(
@@ -119,6 +128,7 @@ class SipFirstVisionModule: NSObject {
       guard let uiImage = UIImage(contentsOfFile: cleanPath),
             let cgImage = uiImage.cgImage else {
         resolver(["faceDetected": false, "glassDetected": false,
+                  "hasLiquid": false, "liquidLevel": "unknown", "liquidLevelNorm": 0.0,
                   "topLabels": ["img_load_fail"]])
         return
       }
@@ -145,6 +155,8 @@ class SipFirstVisionModule: NSObject {
       var faceDetected  = false
       var glassDetected = false
       var calibInfo: [String] = []
+      // Declared here so Stage 2 (after the do/catch block) can access them.
+      var bestRect: CGRect? = nil
 
       do {
         try handler.perform([faceReq, handReq, rectReq])
@@ -156,6 +168,7 @@ class SipFirstVisionModule: NSObject {
 
         guard let face = faces.first else {
           resolver(["faceDetected": false, "glassDetected": false,
+                    "hasLiquid": false, "liquidLevel": "unknown", "liquidLevelNorm": 0.0,
                     "topLabels": calibInfo])
           return
         }
@@ -238,8 +251,7 @@ class SipFirstVisionModule: NSObject {
         geoCandidates.sort { $0.distToHand < $1.distToHand }
 
         // ── Signal 4 · Pixel-level transparency (best of candidates) ────────
-        var bestRect:  CGRect?             = nil
-        var bestTR:    TransparencyResult? = nil
+        var bestTR: TransparencyResult? = nil   // bestRect hoisted above do/catch
 
         for (rect, _) in geoCandidates.prefix(8) {
           let tr = SipFirstVisionModule.analyzeTransparency(
@@ -321,10 +333,38 @@ class SipFirstVisionModule: NSObject {
         calibInfo.append("err:\(error.localizedDescription)")
       }
 
+      // ── Stage 2 · Liquid level detection ──────────────────────────────────────
+      // Only runs when Stage 1 has confirmed a transparent glass. This keeps the
+      // fast path (no glass) as cheap as possible.
+      var hasLiquid       = false
+      var liquidLevelNorm = Float(0.0)
+      var liquidLevel     = "unknown"
+
+      // Run liquid detection whenever we have a rect candidate, regardless of
+      // per-frame glassDetected. The JS pipeline already confirmed the glass
+      // stably before entering Step 2, so per-frame gate here causes most
+      // frames to return unknown/0.00 even with a glass visibly in frame.
+      if let rect = bestRect {
+        let lr = SipFirstVisionModule.detectLiquidLevel(cgImage: cgImage, glassRect: rect)
+        hasLiquid       = lr.hasLiquid
+        liquidLevelNorm = lr.levelNorm
+        liquidLevel     = lr.level.rawValue
+        calibInfo.append(
+          "liquid hasLiquid:\(lr.hasLiquid)" +
+          " level:\(lr.level.rawValue)" +
+          " norm:\(String(format:"%.2f",lr.levelNorm))" +
+          " conf:\(String(format:"%.2f",lr.confidence))"
+        )
+        calibInfo.append(lr.debug)
+      }
+
       resolver([
-        "faceDetected": faceDetected,
-        "glassDetected": glassDetected,
-        "topLabels": calibInfo
+        "faceDetected":    faceDetected,
+        "glassDetected":   glassDetected,
+        "hasLiquid":       hasLiquid,
+        "liquidLevel":     liquidLevel,
+        "liquidLevelNorm": liquidLevelNorm,
+        "topLabels":       calibInfo
       ])
     }
   }
@@ -666,6 +706,174 @@ class SipFirstVisionModule: NSObject {
       bgScore: bgScore, bgDiff: bgDiff,
       combined: combined,
       rejectionTag: rejTag,
+      debug: debug
+    )
+  }
+
+  // MARK: – Liquid level detection
+
+  /// Detects whether liquid is present in a confirmed glass and estimates fill level.
+  ///
+  /// Algorithm — vertical row-profile meniscus detection:
+  ///
+  ///   1. Sample the centre 50 % of the glass width (avoid wall-edge specular spikes).
+  ///   2. Compute per-row mean lightness → 1-D brightness profile along glass height.
+  ///   3. Apply 3-tap moving-average smoothing to suppress single-pixel reflections.
+  ///   4. Compute first derivative (row-to-row Δ lightness).
+  ///   5. The meniscus is the row with the largest |Δ|, excluding rim artefacts
+  ///      (top/bottom 12 % of the glass height).
+  ///   6. Validate: above/below region means must differ by > noiseFloor.
+  ///   7. Fallback for a completely full glass (no visible meniscus): classify by
+  ///      overall interior lightness + saturation fingerprint.
+  ///
+  /// glassRect must be in Vision normalised coordinates (origin bottom-left, y upward).
+  private static func detectLiquidLevel(
+    cgImage: CGImage,
+    glassRect: CGRect
+  ) -> LiquidResult {
+
+    // ── Parameters ────────────────────────────────────────────────────────────
+    let numRows:              Int   = 60     // vertical sample resolution
+    let numCols:              Int   = 20     // horizontal sample resolution (centre strip)
+    let centerInset:          Float = 0.25   // fraction of glass width to inset on each side
+    let skipFrac:             Float = 0.12   // skip top + bottom 12 % to ignore rim reflections
+    let noiseFloor:           Float = 0.010  // min |Δ| to count as a real meniscus (lowered: clear water produces subtle gradient)
+
+    // ── Centre-strip ROI ──────────────────────────────────────────────────────
+    // Inset horizontally to avoid the bright glass-wall specular highlights that
+    // would otherwise dominate every row mean and mask the meniscus step.
+    let insetX    = glassRect.width * CGFloat(centerInset)
+    let innerRect = CGRect(
+      x:      glassRect.minX + insetX,
+      y:      glassRect.minY,
+      width:  max(CGFloat(0.01), glassRect.width  - insetX * 2),
+      height: max(CGFloat(0.01), glassRect.height)
+    )
+
+    let samples = sampleRegion(
+      cgImage: cgImage, normRect: innerRect,
+      sampleW: numCols, sampleH: numRows
+    )
+
+    guard samples.count == numRows * numCols else {
+      return LiquidResult(hasLiquid: false, levelNorm: 0, level: .empty,
+                          confidence: 0, debug: "sampleFail(\(samples.count))")
+    }
+
+    // ── Step 1: per-row means ─────────────────────────────────────────────────
+    // Row 0 = top of glass, row numRows-1 = bottom of glass (CGImage y-down).
+    var rowL = [Float](repeating: 0, count: numRows)
+    var rowS = [Float](repeating: 0, count: numRows)
+    for row in 0..<numRows {
+      var sumL: Float = 0, sumS: Float = 0
+      for col in 0..<numCols {
+        let s = samples[row * numCols + col]
+        sumL += s.lightness; sumS += s.saturation
+      }
+      rowL[row] = sumL / Float(numCols)
+      rowS[row] = sumS / Float(numCols)
+    }
+
+    // ── Step 2: 5-tap smoothing ───────────────────────────────────────────────
+    // Wider kernel reduces single-pixel reflection noise without blurring the
+    // meniscus step (which spans several rows). Edge rows fall back to 3-tap.
+    var smooth = rowL
+    for i in 1..<(numRows - 1) {
+      if i >= 2 && i < numRows - 2 {
+        smooth[i] = (rowL[i-2] + rowL[i-1] + rowL[i] + rowL[i+1] + rowL[i+2]) / 5.0
+      } else {
+        smooth[i] = (rowL[i-1] + rowL[i] + rowL[i+1]) / 3.0
+      }
+    }
+
+    // ── Step 3: first derivative ──────────────────────────────────────────────
+    // positive = brighter going downward; negative = darker going downward.
+    // Direction is ambiguous (backlit vs front-lit), so we search by |Δ|.
+    var deriv = [Float](repeating: 0, count: numRows - 1)
+    for i in 0..<(numRows - 1) { deriv[i] = smooth[i + 1] - smooth[i] }
+
+    // ── Step 4: locate meniscus candidate ────────────────────────────────────
+    let skip = max(2, Int(Float(numRows) * skipFrac))  // skipFrac is Float — types match
+    var meniscusRow    = -1
+    var maxAbsDeriv: Float = 0
+    for i in skip..<(numRows - 1 - skip) {
+      let a = abs(deriv[i])
+      if a > maxAbsDeriv { maxAbsDeriv = a; meniscusRow = i }
+    }
+
+    // ── Step 5: validate — or fall back for a fully-filled glass ─────────────
+    guard meniscusRow >= 0 && maxAbsDeriv > noiseFloor else {
+      // No clear step = empty OR completely full (no air/liquid interface visible).
+      // Heuristic: a glass uniformly filled with clear water appears slightly
+      // darker than an empty glass (absorption) with low saturation.
+      let avgL = rowL.reduce(0, +) / Float(numRows)
+      let avgS = rowS.reduce(0, +) / Float(numRows)
+      // Relaxed: clear water in normal indoor light can have avgL up to ~0.68
+      // and avgS up to ~0.22. Strict conditions caused full glasses to miss this path.
+      let likelyFull = avgL < 0.68 && avgS < 0.22
+      if likelyFull {
+        return LiquidResult(
+          hasLiquid: true, levelNorm: 1.0, level: .full, confidence: 0.40,
+          debug: "noMeniscus(likelyFull)" +
+                 " L:\(String(format:"%.2f",avgL))" +
+                 " S:\(String(format:"%.2f",avgS))"
+        )
+      }
+      return LiquidResult(
+        hasLiquid: false, levelNorm: 0, level: .empty, confidence: 0,
+        debug: "noMeniscus maxDeriv:\(String(format:"%.3f",maxAbsDeriv))"
+      )
+    }
+
+    // ── Step 6: above / below region means ───────────────────────────────────
+    var aboveMean: Float = 0
+    var belowMean: Float = 0
+
+    if meniscusRow > 0 {
+      for i in 0..<meniscusRow { aboveMean += smooth[i] }
+      aboveMean /= Float(meniscusRow)
+    }
+    let belowStart = meniscusRow + 1
+    if belowStart < numRows {
+      for i in belowStart..<numRows { belowMean += smooth[i] }
+      belowMean /= Float(numRows - belowStart)
+    }
+    let regionDiff = abs(aboveMean - belowMean)
+
+    // ── Step 7: confidence ────────────────────────────────────────────────────
+    let derivConf  = min(1.0, maxAbsDeriv / 0.06)  // full confidence at |Δ| ≥ 0.06 (lowered from 0.08)
+    let regionConf = min(1.0, regionDiff  / 0.025) // full confidence at diff ≥ 0.025 (lowered from 0.04)
+    let confidence = (derivConf + regionConf) / 2.0
+
+    // ── Step 8: fill level and label ─────────────────────────────────────────
+    // row 0 = top, so liquid occupies rows [meniscusRow, numRows-1].
+    let levelNorm = min(1.0, max(0.0,
+      Float(numRows - meniscusRow) / Float(numRows)
+    ))
+
+    let levelLabel: LiquidResult.Level
+    switch levelNorm {
+    case ..<0.15:  levelLabel = .empty
+    case ..<0.35:  levelLabel = .low
+    case ..<0.65:  levelLabel = .medium
+    case ..<0.85:  levelLabel = .high
+    default:       levelLabel = .full
+    }
+
+    let debug =
+      "men:\(meniscusRow)/\(numRows)" +
+      " |Δ|:\(String(format:"%.3f",maxAbsDeriv))" +
+      " above:\(String(format:"%.3f",aboveMean))" +
+      " below:\(String(format:"%.3f",belowMean))" +
+      " diff:\(String(format:"%.3f",regionDiff))" +
+      " lvl:\(String(format:"%.2f",levelNorm))" +
+      " conf:\(String(format:"%.2f",confidence))"
+
+    return LiquidResult(
+      hasLiquid: confidence > 0.20,
+      levelNorm: levelNorm,
+      level: levelLabel,
+      confidence: confidence,
       debug: debug
     )
   }

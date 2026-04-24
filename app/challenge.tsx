@@ -1,48 +1,60 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef } from "react";
 import { StyleSheet, TouchableOpacity, View } from "react-native";
 import { Camera, useCameraDevice, useCameraPermission } from "react-native-vision-camera";
 
 import { ThemedText } from "@/components/themed-text";
-import { useChallengeDetection } from "@/hooks/use-challenge-detection";
+import {
+  useDetectionPipeline,
+  type LiquidLevel,
+  type PipelineStep,
+} from "@/hooks/use-detection-pipeline";
 
-type ChallengeParams = {
-  token?: string;
-  label?: string;
-};
+type ChallengeParams = { token?: string; label?: string };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function getMissingMessage(faceDetected: boolean, glassDetected: boolean): string | null {
+function getStep1Message(faceDetected: boolean, glassDetected: boolean): string | null {
   if (!faceDetected && !glassDetected) return "Face and glass both missing";
   if (!faceDetected) return "Face missing";
   if (!glassDetected) return "Transparent glass missing";
   return null;
 }
 
+function getStep2Message(hasLiquid: boolean, level: LiquidLevel, norm: number): string {
+  if (!hasLiquid) return "No liquid detected in glass";
+  if (level === "empty" || norm < 0.70) return `Fill to 70%+ — currently ${Math.round(norm * 100)}%`;
+  return `Water level OK: ${level} (${Math.round(norm * 100)}%)`;
+}
+
+function getHeaderSub(step: PipelineStep, appLabel: string): string {
+  if (step === 1) return `Hold your face and a glass of water in view to unlock ${appLabel}`;
+  if (step === 2) return "Glass confirmed — show the water level in your glass";
+  return "Step 3: drink detection coming soon…";
+}
+
 // ─── Screen ───────────────────────────────────────────────────────────────────
 
 export default function ChallengeScreen() {
   const { label } = useLocalSearchParams<ChallengeParams>();
-  const router = useRouter();
+  const router    = useRouter();
   const { hasPermission, requestPermission } = useCameraPermission();
-  const device = useCameraDevice("front");
+  const device    = useCameraDevice("front");
   const cameraRef = useRef<Camera>(null);
-
-  // "detecting" → running Step 1   "detected" → both confirmed, ready for Step 2
-  const [step1Done, setStep1Done] = useState(false);
 
   const appLabel = label ?? "Selected App";
 
-  const handleStable = useCallback(() => {
-    // Step 1 complete: face + glass confirmed stably.
-    // Step 2 (water level check) will be wired here next.
-    setStep1Done(true);
-  }, []);
+  // onComplete fires when all three steps pass. Step 3 is still a stub,
+  // so this won't fire until Step 3 detection is implemented.
+  const handleComplete = useCallback(() => {
+    router.back();
+  }, [router]);
 
-  const { state, reset } = useChallengeDetection(cameraRef, handleStable);
+  const { state, reset } = useDetectionPipeline(cameraRef, handleComplete);
+  const { activeStep, stepStatus, faceDetected, glassDetected, hasLiquid, liquidLevel, liquidLevelNorm, liquidAboveThreshold } = state;
 
   // ── Permission gate ──────────────────────────────────────────────────────────
+
   if (!hasPermission) {
     return (
       <View style={styles.gateContainer}>
@@ -63,66 +75,104 @@ export default function ChallengeScreen() {
     );
   }
 
-  // ── Status overlay content ───────────────────────────────────────────────────
-  const { faceDetected, glassDetected, stage } = state;
-  const missingMessage = !step1Done ? getMissingMessage(faceDetected, glassDetected) : null;
+  // ── Derived UI values ────────────────────────────────────────────────────────
+
+  const step1Message = activeStep === 1 && stepStatus === "detecting"
+    ? getStep1Message(faceDetected, glassDetected)
+    : null;
+
+  const step2Message = activeStep === 2 && stepStatus === "detecting"
+    ? getStep2Message(hasLiquid, liquidLevel, liquidLevelNorm)
+    : null;
 
   return (
     <View style={styles.container}>
-      {/* Live camera preview – active only while detecting */}
+
+      {/* Live camera — active only while steps 1 and 2 are running */}
       <Camera
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
-        isActive={!step1Done}
+        isActive={activeStep < 3}
         photo
       />
 
-      {/* ── Header ──────────────────────────────────────────────────────────── */}
+      {/* ── Header ────────────────────────────────────────────────────────────── */}
       <View style={styles.header}>
         <ThemedText type="title" style={styles.headerTitle}>
           Hydration Challenge
         </ThemedText>
         <ThemedText style={styles.headerSub}>
-          {step1Done
-            ? `Step 1 complete for ${appLabel}`
-            : `Hold your face and a glass of water in view to unlock ${appLabel}`}
+          {getHeaderSub(activeStep, appLabel)}
         </ThemedText>
       </View>
 
-      {/* ── Detection feedback (only during searching / stabilizing) ─────────── */}
-      {!step1Done && (
+      {/* ── Step indicator ────────────────────────────────────────────────────── */}
+      <View style={styles.stepRow}>
+        {([1, 2, 3] as const).map(s => (
+          <View
+            key={s}
+            style={[
+              styles.stepPill,
+              activeStep === s && styles.stepPillActive,
+              activeStep > s  && styles.stepPillDone,
+            ]}
+          >
+            <ThemedText style={[
+              styles.stepPillText,
+              (activeStep === s || activeStep > s) && styles.stepPillTextLight,
+            ]}>
+              {s}
+            </ThemedText>
+          </View>
+        ))}
+      </View>
+
+      {/* ── Step 1 feedback ───────────────────────────────────────────────────── */}
+      {activeStep === 1 && (
         <View style={styles.feedbackRow}>
-          {stage === "stabilizing" && (
+          {stepStatus === "stabilizing" && (
             <View style={[styles.badge, styles.badgeStabilizing]}>
               <ThemedText style={styles.badgeText}>Hold still…</ThemedText>
             </View>
           )}
-
-          {stage === "searching" && missingMessage && (
+          {step1Message && (
             <View style={[styles.badge, styles.badgeMissing]}>
-              <ThemedText style={styles.badgeText}>{missingMessage}</ThemedText>
+              <ThemedText style={styles.badgeText}>{step1Message}</ThemedText>
             </View>
           )}
         </View>
       )}
 
-      {/* ── Step 1 success state ─────────────────────────────────────────────── */}
-      {step1Done && (
+      {/* ── Step 2 feedback ───────────────────────────────────────────────────── */}
+      {activeStep === 2 && (
+        <View style={styles.feedbackRow}>
+          {stepStatus === "stabilizing" && (
+            <View style={[styles.badge, styles.badgeStabilizing]}>
+              <ThemedText style={styles.badgeText}>Hold still…</ThemedText>
+            </View>
+          )}
+          {step2Message && (
+            <View style={[
+              styles.badge,
+              liquidAboveThreshold ? styles.badgeOk : styles.badgeMissing,
+            ]}>
+              <ThemedText style={styles.badgeText}>{step2Message}</ThemedText>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* ── Step 3 stub ───────────────────────────────────────────────────────── */}
+      {activeStep === 3 && (
         <View style={styles.successContainer}>
           <ThemedText style={styles.successText}>
-            Face and glass detected
+            Steps 1 & 2 Complete ✓
           </ThemedText>
           <ThemedText style={styles.successSub}>
-            Step 2 – water level check – coming next.
+            Step 3 — drink detection — coming next.
           </ThemedText>
-          <TouchableOpacity
-            onPress={() => {
-              setStep1Done(false);
-              reset();
-            }}
-            style={styles.secondaryButton}
-          >
+          <TouchableOpacity onPress={reset} style={styles.secondaryButton}>
             <ThemedText>Try again</ThemedText>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => router.back()} style={styles.ghostButton}>
@@ -130,6 +180,7 @@ export default function ChallengeScreen() {
           </TouchableOpacity>
         </View>
       )}
+
     </View>
   );
 }
@@ -147,6 +198,8 @@ const styles = StyleSheet.create({
     gap: 16,
     justifyContent: "center",
   },
+
+  // Header
   header: {
     position: "absolute",
     top: 60,
@@ -169,6 +222,45 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 3,
   },
+
+  // Step indicators
+  stepRow: {
+    position: "absolute",
+    top: 160,
+    left: 0,
+    right: 0,
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 12,
+  },
+  stepPill: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    borderWidth: 2,
+    borderColor: "rgba(255,255,255,0.5)",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.3)",
+  },
+  stepPillActive: {
+    borderColor: "#fff",
+    backgroundColor: "rgba(10,132,255,0.85)",
+  },
+  stepPillDone: {
+    borderColor: "#16a34a",
+    backgroundColor: "#16a34a",
+  },
+  stepPillText: {
+    color: "rgba(255,255,255,0.6)",
+    fontWeight: "700",
+    fontSize: 15,
+  },
+  stepPillTextLight: {
+    color: "#fff",
+  },
+
+  // Detection feedback
   feedbackRow: {
     position: "absolute",
     bottom: 80,
@@ -182,16 +274,21 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
   badgeMissing: {
-    backgroundColor: "rgba(220, 38, 38, 0.85)", // red-600 with alpha
+    backgroundColor: "rgba(220,38,38,0.85)",
   },
   badgeStabilizing: {
-    backgroundColor: "rgba(234, 179, 8, 0.85)", // yellow-500 with alpha
+    backgroundColor: "rgba(234,179,8,0.85)",
+  },
+  badgeOk: {
+    backgroundColor: "rgba(22,163,74,0.85)",
   },
   badgeText: {
     color: "#fff",
     fontWeight: "600",
     fontSize: 15,
   },
+
+  // Step 3 stub / success panel
   successContainer: {
     position: "absolute",
     bottom: 0,
@@ -207,12 +304,14 @@ const styles = StyleSheet.create({
   successText: {
     fontSize: 18,
     fontWeight: "700",
-    color: "#16a34a", // green-600
+    color: "#16a34a",
   },
   successSub: {
     color: "#52525b",
     textAlign: "center",
   },
+
+  // Buttons
   primaryButton: {
     borderRadius: 10,
     backgroundColor: "#0a84ff",
