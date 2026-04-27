@@ -7,7 +7,7 @@ const { SipFirstVisionModule } = NativeModules;
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const STABLE_REQUIRED     = 3;     // consecutive gate-passes before step advances
-const MISS_TOLERANCE      = 2;     // consecutive gate-fails allowed before stable drops
+const MISS_TOLERANCE      = 1;     // consecutive gate-fails allowed before stable drops
 const CAPTURE_INTERVAL_MS = 500;   // ms between capture + analysis rounds
 
 // ── Step 2 EMA parameters ────────────────────────────────────────────────────
@@ -24,13 +24,19 @@ const CAPTURE_INTERVAL_MS = 500;   // ms between capture + analysis rounds
 //
 // Result: EMA stabilises at the TRUE level for high frames (~0.65–0.85)
 //   and decays to zero only after many consecutive low/false frames (~20s).
+//
+// Seed multiplier: first reading seeds EMA at 70 % weight to prevent a single
+//   lucky frame from immediately clearing the gate. Genuine full glasses
+//   recover within 2–3 additional frames; half-filled glasses with erratic
+//   readings cannot sustain EMA above EMA_GATE long enough to reach stable=3.
 
 const LEVEL_EMA_ALPHA    = 0.50;   // response speed on each high-value update
 const LEVEL_EMA_MIN      = 0.40;   // raw norm must exceed this to update EMA
 const LEVEL_EMA_DECAY    = 0.993;  // passive decay per frame when no update
-const EMA_GATE           = 0.62;   // EMA must reach this to signal "full enough"
-const RAW_FAST_GATE      = 0.82;   // single very-high raw bypasses EMA climb
-const RAW_FAST_EMA_MIN   = 0.45;   // …but EMA must also show some evidence
+const LEVEL_EMA_SEED_MUL = 0.70;   // first-reading seed weight (conservative)
+const EMA_GATE           = 0.68;   // EMA must reach this to signal "full enough"
+const RAW_FAST_GATE      = 0.85;   // single very-high raw can bypass EMA climb…
+const RAW_FAST_EMA_MIN   = 0.62;   // …but EMA must already show real substance
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -73,7 +79,7 @@ interface NativeResult {
 function updateLevelEma(ema: number, rawHasLiquid: boolean, rawNorm: number): number {
   if (rawHasLiquid && rawNorm >= LEVEL_EMA_MIN) {
     // Active update — incorporate a genuine high-level reading.
-    if (ema < 0) return rawNorm;                                         // first seed
+    if (ema < 0) return rawNorm * LEVEL_EMA_SEED_MUL;                    // first seed — conservative
     return LEVEL_EMA_ALPHA * rawNorm + (1 - LEVEL_EMA_ALPHA) * ema;
   }
   // Passive decay — no high reading this frame.
