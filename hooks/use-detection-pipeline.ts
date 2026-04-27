@@ -6,11 +6,31 @@ const { SipFirstVisionModule } = NativeModules;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STABLE_REQUIRED       = 3;    // consecutive hits before a step is "stable"
-const MISS_HYSTERESIS       = 4;    // consecutive misses before stable count resets
-const CAPTURE_INTERVAL_MS   = 500;  // ms between each photo + analysis round
-const LIQUID_BUFFER_SIZE    = 3;    // rolling window depth for Step 2 temporal smoothing
-const LIQUID_LEVEL_MIN_NORM = 0.70; // minimum fill ratio required to pass Step 2 gate
+const STABLE_REQUIRED     = 3;     // consecutive gate-passes before step advances
+const MISS_TOLERANCE      = 2;     // consecutive gate-fails allowed before stable drops
+const CAPTURE_INTERVAL_MS = 500;   // ms between capture + analysis rounds
+
+// ── Step 2 EMA parameters ────────────────────────────────────────────────────
+//
+// Core insight from log analysis:
+//   The native meniscus detector reports raw values of 0.80–0.88 on only
+//   ~1 in 8 frames. The other 7 frames are low (0.15–0.35) or zero.
+//   Including those low frames in any mean or EMA drags the estimate down.
+//
+// Fix: high-pass input filter — only update the EMA when raw > MIN_INPUT.
+//   Low/false frames do NOT reset the EMA. Instead the EMA decays slowly
+//   (PASSIVE_DECAY) which handles the "glass put down" case without letting
+//   a single miss frames undo accumulated evidence.
+//
+// Result: EMA stabilises at the TRUE level for high frames (~0.65–0.85)
+//   and decays to zero only after many consecutive low/false frames (~20s).
+
+const LEVEL_EMA_ALPHA    = 0.50;   // response speed on each high-value update
+const LEVEL_EMA_MIN      = 0.40;   // raw norm must exceed this to update EMA
+const LEVEL_EMA_DECAY    = 0.993;  // passive decay per frame when no update
+const EMA_GATE           = 0.62;   // EMA must reach this to signal "full enough"
+const RAW_FAST_GATE      = 0.82;   // single very-high raw bypasses EMA climb
+const RAW_FAST_EMA_MIN   = 0.45;   // …but EMA must also show some evidence
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -25,8 +45,8 @@ export interface PipelineState {
   glassDetected:        boolean;
   hasLiquid:            boolean;
   liquidLevel:          LiquidLevel;
-  liquidLevelNorm:      number;   // smoothed 0.0 → 1.0
-  liquidAboveThreshold: boolean;  // smoothed norm >= LIQUID_LEVEL_MIN_NORM
+  liquidLevelNorm:      number;    // EMA value, 0.0 → 1.0
+  liquidAboveThreshold: boolean;
 }
 
 interface NativeResult {
@@ -38,23 +58,71 @@ interface NativeResult {
   topLabels:       string[];
 }
 
-// ─── Hook ─────────────────────────────────────────────────────────────────────
+// ─── Step 2 helpers ───────────────────────────────────────────────────────────
 
 /**
- * Three-step sequential detection pipeline:
+ * EMA with high-pass input filter + passive decay.
  *
- *   Step 1 — Glass detection   (face + transparent glass stably confirmed)
- *   Step 2 — Liquid gate       (liquid present AND liquidLevelNorm >= 70%)
- *   Step 3 — Drinking stub     (no logic yet; logs intent and parks)
+ * Why this design:
+ *   Old mean/EMA: frame [0.88, 0.00, 0.00, 0.00, 0.00] → mean = 0.18 (fails)
+ *   This EMA:     same frames → EMA stays at 0.88 * decay^4 ≈ 0.85 (passes)
  *
- * Step 2 applies temporal smoothing over a rolling buffer of LIQUID_BUFFER_SIZE
- * frames before evaluating the gate, preventing single-frame flicker from
- * causing premature pass or fail.
- *
- * Each step requires STABLE_REQUIRED consecutive positive frames before
- * advancing. Up to MISS_HYSTERESIS misses are tolerated before the stable
- * counter resets.
+ * The EMA only CLIMBS on frames where raw > LEVEL_EMA_MIN (genuine signal).
+ * It DECAYS slowly on all other frames. It never takes a sudden negative hit.
  */
+function updateLevelEma(ema: number, rawHasLiquid: boolean, rawNorm: number): number {
+  if (rawHasLiquid && rawNorm >= LEVEL_EMA_MIN) {
+    // Active update — incorporate a genuine high-level reading.
+    if (ema < 0) return rawNorm;                                         // first seed
+    return LEVEL_EMA_ALPHA * rawNorm + (1 - LEVEL_EMA_ALPHA) * ema;
+  }
+  // Passive decay — no high reading this frame.
+  // Decays to zero over ~20 seconds of silence, handling "glass put down".
+  return ema < 0 ? -1 : ema * LEVEL_EMA_DECAY;
+}
+
+/**
+ * Step 2 gate — EMA-only, no vote.
+ *
+ * Why no vote:
+ *   The vote tracks raw hasLiquid which is false on ~65% of frames.
+ *   Requiring majority vote means the gate almost never opens even when
+ *   EMA has correctly climbed to 0.70–0.79 (as seen repeatedly in logs).
+ *   The EMA itself IS the multi-frame evidence — a separate vote is redundant.
+ *
+ * Primary:     EMA ≥ 0.62  (sustained evidence of high fill)
+ * Supplemental: raw ≥ 0.82 AND EMA ≥ 0.45  (very high single frame + climbing EMA)
+ */
+function step2Gate(ema: number, rawHasLiquid: boolean, rawNorm: number): boolean {
+  if (ema >= EMA_GATE) return true;
+  if (rawHasLiquid && rawNorm >= RAW_FAST_GATE && ema >= RAW_FAST_EMA_MIN) return true;
+  return false;
+}
+
+/**
+ * Stable counter with miss hysteresis.
+ * MISS_TOLERANCE consecutive fails are absorbed before stable count drops by 1.
+ * Count never zeroes from a single fail — momentum is preserved.
+ */
+function updateStable(
+  pass:        boolean,
+  count:       number,
+  missStreak:  { current: number },
+): number {
+  if (pass) {
+    missStreak.current = 0;
+    return count + 1;
+  }
+  missStreak.current += 1;
+  if (missStreak.current > MISS_TOLERANCE) {
+    missStreak.current = 0;
+    return Math.max(0, count - 1);
+  }
+  return count;   // within tolerance — hold position
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
 export function useDetectionPipeline(
   cameraRef: React.RefObject<Camera | null>,
   onComplete: () => void,
@@ -71,31 +139,25 @@ export function useDetectionPipeline(
     liquidAboveThreshold: false,
   });
 
-  // All mutable counters live in refs: always current inside the interval
-  // closure, zero re-renders, no stale closure bugs.
   const activeStep      = useRef<PipelineStep>(1);
   const stableCount     = useRef(0);
-  const missCount       = useRef(0);
-  const stepTriggered   = useRef(false);  // prevents double-fire per step
-  const step3Logged     = useRef(false);  // Step 3 stub logs only once
+  const missStreak      = useRef(0);
+  const stepTriggered   = useRef(false);
+  const step3Logged     = useRef(false);
   const isCapturing     = useRef(false);
   const isMounted       = useRef(true);
   const onCompleteRef   = useRef(onComplete);
   onCompleteRef.current = onComplete;
 
-  // Step 2 temporal smoothing — rolling buffers for liquid presence and level
-  const liquidNormBuffer = useRef<number[]>([]);
-  const liquidHitBuffer  = useRef<boolean[]>([]);
+  // Step 2 EMA state — -1 means uninitialised (no readings yet)
+  const levelEma = useRef<number>(-1);
 
-  // Reset all per-step counters when advancing. Clears liquid buffers so
-  // Step 2 starts fresh without stale readings from a prior attempt.
   const advanceToStep = useCallback((next: PipelineStep) => {
-    activeStep.current       = next;
-    stableCount.current      = 0;
-    missCount.current        = 0;
-    stepTriggered.current    = false;
-    liquidNormBuffer.current = [];
-    liquidHitBuffer.current  = [];
+    activeStep.current    = next;
+    stableCount.current   = 0;
+    missStreak.current    = 0;
+    stepTriggered.current = false;
+    levelEma.current      = -1;
   }, []);
 
   const runPipeline = useCallback(async () => {
@@ -103,7 +165,7 @@ export function useDetectionPipeline(
 
     const step = activeStep.current;
 
-    // ── Step 3 stub — no camera capture needed ──────────────────────────────
+    // ── Step 3 stub ──────────────────────────────────────────────────────────
     if (step === 3) {
       if (!step3Logged.current) {
         step3Logged.current = true;
@@ -125,40 +187,26 @@ export function useDetectionPipeline(
       const result: NativeResult = await SipFirstVisionModule.analyzeImage(photo.path);
       if (!isMounted.current) return;
 
-      // ── Step 2 temporal smoothing ───────────────────────────────────────────
-      // Raw values used for step 1; smoothed values used for step 2 signal and UI.
+      const rawNorm = result.liquidLevelNorm ?? 0;
+
+      // ── Step 2: high-pass EMA ───────────────────────────────────────────────
       let effectiveHasLiquid  = result.hasLiquid;
-      let effectiveLiquidNorm = result.liquidLevelNorm ?? 0;
+      let effectiveLiquidNorm = rawNorm;
+      let liquidAboveThreshold = false;
 
       if (step === 2) {
-        liquidNormBuffer.current.push(result.liquidLevelNorm ?? 0);
-        liquidHitBuffer.current.push(result.hasLiquid);
-        if (liquidNormBuffer.current.length > LIQUID_BUFFER_SIZE) {
-          liquidNormBuffer.current.shift();
-          liquidHitBuffer.current.shift();
-        }
-        const bufLen        = liquidHitBuffer.current.length;
-        effectiveHasLiquid  = liquidHitBuffer.current.filter(Boolean).length > bufLen / 2;
-        effectiveLiquidNorm = liquidNormBuffer.current.reduce((a, b) => a + b, 0) / Math.max(1, bufLen);
+        levelEma.current    = updateLevelEma(levelEma.current, result.hasLiquid, rawNorm);
+        const ema           = levelEma.current < 0 ? 0 : levelEma.current;
+        effectiveLiquidNorm = ema;
+        effectiveHasLiquid  = ema > 0;
+        liquidAboveThreshold = step2Gate(ema, result.hasLiquid, rawNorm);
       }
 
-      const liquidAboveThreshold = effectiveHasLiquid && effectiveLiquidNorm >= LIQUID_LEVEL_MIN_NORM;
+      // ── Step 1 signal ───────────────────────────────────────────────────────
+      const signalPass = step === 1 ? result.glassDetected : liquidAboveThreshold;
 
-      // ── Signal for this step ────────────────────────────────────────────────
-      // Step 2 gate: liquid must be present AND fill level >= 70%.
-      const signalHit = step === 1 ? result.glassDetected : liquidAboveThreshold;
-
-      // ── Hysteresis counter ──────────────────────────────────────────────────
-      if (signalHit) {
-        stableCount.current += 1;
-        missCount.current    = 0;
-      } else {
-        missCount.current += 1;
-        if (missCount.current >= MISS_HYSTERESIS) {
-          stableCount.current = 0;
-          missCount.current   = 0;
-        }
-      }
+      // ── Stability counter ───────────────────────────────────────────────────
+      stableCount.current = updateStable(signalPass, stableCount.current, missStreak);
 
       const stepStatus: StepStatus =
         stableCount.current >= STABLE_REQUIRED ? "stable"
@@ -174,21 +222,21 @@ export function useDetectionPipeline(
           ` stable=${stableCount.current}/${STABLE_REQUIRED} status=${stepStatus}`,
         );
       } else {
+        const emaDisplay = (levelEma.current < 0 ? 0 : levelEma.current).toFixed(2);
         console.log("[SipFirst] STEP 2 START");
         console.log(
-          `[SipFirst] Liquid detected: ${result.hasLiquid} → smoothed: ${effectiveHasLiquid}`,
+          `[SipFirst] Liquid detected: ${result.hasLiquid}` +
+          ` raw:${rawNorm.toFixed(2)} ema:${emaDisplay}`,
         );
         console.log(
-          `[SipFirst] Liquid level: ${result.liquidLevel}` +
-          ` (raw: ${(result.liquidLevelNorm ?? 0).toFixed(2)}, smoothed: ${effectiveLiquidNorm.toFixed(2)})`,
+          `[SipFirst] gate=${liquidAboveThreshold}` +
+          ` stable=${stableCount.current}/${STABLE_REQUIRED}` +
+          ` miss=${missStreak.current}/${MISS_TOLERANCE}` +
+          ` status=${stepStatus}`,
         );
-        console.log(
-          `[SipFirst] step=2 stable=${stableCount.current}/${STABLE_REQUIRED} status=${stepStatus}`,
-        );
-        if (!signalHit) {
+        if (!signalPass) {
           console.log(
-            `[SipFirst] STEP 2 FAILED → liquidDetected: ${effectiveHasLiquid}, ` +
-            `level: ${result.liquidLevel ?? "unknown"}, norm: ${effectiveLiquidNorm.toFixed(2)}`,
+            `[SipFirst] STEP 2 FAILED → raw:${rawNorm.toFixed(2)} ema:${emaDisplay}`,
           );
         }
       }
@@ -212,9 +260,7 @@ export function useDetectionPipeline(
           console.log("[SipFirst] ✓ Step 1 complete — advancing to Step 2");
           advanceToStep(2);
         } else {
-          console.log(
-            `[SipFirst] STEP 2 PASSED → liquid OK (>=${Math.round(LIQUID_LEVEL_MIN_NORM * 100)}%) → moving to Step 3`,
-          );
+          console.log("[SipFirst] STEP 2 PASSED → liquid OK → moving to Step 3");
           console.log("[SipFirst] Step 3 – checking user drinking water – coming next");
           advanceToStep(3);
           setState(prev => ({ ...prev, activeStep: 3, stepStatus: "detecting" }));
@@ -238,13 +284,12 @@ export function useDetectionPipeline(
   }, [runPipeline]);
 
   const reset = useCallback(() => {
-    activeStep.current       = 1;
-    stableCount.current      = 0;
-    missCount.current        = 0;
-    stepTriggered.current    = false;
-    step3Logged.current      = false;
-    liquidNormBuffer.current = [];
-    liquidHitBuffer.current  = [];
+    activeStep.current    = 1;
+    stableCount.current   = 0;
+    missStreak.current    = 0;
+    stepTriggered.current = false;
+    step3Logged.current   = false;
+    levelEma.current      = -1;
     setState({
       activeStep:           1,
       stepStatus:           "detecting",

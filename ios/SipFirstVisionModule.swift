@@ -530,7 +530,7 @@ class SipFirstVisionModule: NSObject {
       if ringArea > 0.0001 {
         let ringMean = (outerMean * outerArea - meanL * innerArea) / ringArea
         bgDiff  = abs(meanL - ringMean)
-        bgScore = max(0, min(1, 1.0 - bgDiff / 0.10))
+        bgScore = max(0, min(1, 1.0 - bgDiff / 0.18))
       }
     }
 
@@ -737,7 +737,7 @@ class SipFirstVisionModule: NSObject {
     let numCols:              Int   = 20     // horizontal sample resolution (centre strip)
     let centerInset:          Float = 0.25   // fraction of glass width to inset on each side
     let skipFrac:             Float = 0.12   // skip top + bottom 12 % to ignore rim reflections
-    let noiseFloor:           Float = 0.010  // min |Δ| to count as a real meniscus (lowered: clear water produces subtle gradient)
+    let noiseFloor:           Float = 0.007  // min |Δ| to count as a real meniscus (lowered: clear water produces subtle gradient)
 
     // ── Centre-strip ROI ──────────────────────────────────────────────────────
     // Inset horizontally to avoid the bright glass-wall specular highlights that
@@ -810,7 +810,11 @@ class SipFirstVisionModule: NSObject {
       let avgS = rowS.reduce(0, +) / Float(numRows)
       // Relaxed: clear water in normal indoor light can have avgL up to ~0.68
       // and avgS up to ~0.22. Strict conditions caused full glasses to miss this path.
-      let likelyFull = avgL < 0.68 && avgS < 0.22
+      let variance = rowL.map { ($0 - avgL) * ($0 - avgL) }.reduce(0, +) / Float(numRows)
+      let likelyFull =
+          avgL < 0.70 &&
+          avgS < 0.25 &&
+          variance > 0.002   // ensures it's not flat empty glass
       if likelyFull {
         return LiquidResult(
           hasLiquid: true, levelNorm: 1.0, level: .full, confidence: 0.40,
@@ -841,16 +845,14 @@ class SipFirstVisionModule: NSObject {
     let regionDiff = abs(aboveMean - belowMean)
 
     // ── Step 7: confidence ────────────────────────────────────────────────────
-    let derivConf  = min(1.0, maxAbsDeriv / 0.06)  // full confidence at |Δ| ≥ 0.06 (lowered from 0.08)
-    let regionConf = min(1.0, regionDiff  / 0.025) // full confidence at diff ≥ 0.025 (lowered from 0.04)
-    let confidence = (derivConf + regionConf) / 2.0
+    let derivConf  = min(1.0, maxAbsDeriv / 0.05)
+    let regionConf = min(1.0, regionDiff  / 0.020)
+    let confidence = (derivConf * 0.6 + regionConf * 0.4)
 
     // ── Step 8: fill level and label ─────────────────────────────────────────
     // row 0 = top, so liquid occupies rows [meniscusRow, numRows-1].
-    let levelNorm = min(1.0, max(0.0,
-      Float(numRows - meniscusRow) / Float(numRows)
-    ))
-
+    var levelNorm = Float(numRows - meniscusRow) / Float(numRows)
+        levelNorm = min(1.0, max(0.0, levelNorm))
     let levelLabel: LiquidResult.Level
     switch levelNorm {
     case ..<0.15:  levelLabel = .empty
@@ -870,7 +872,7 @@ class SipFirstVisionModule: NSObject {
       " conf:\(String(format:"%.2f",confidence))"
 
     return LiquidResult(
-      hasLiquid: confidence > 0.20,
+      hasLiquid: confidence > 0.15,
       levelNorm: levelNorm,
       level: levelLabel,
       confidence: confidence,
