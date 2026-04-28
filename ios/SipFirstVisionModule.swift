@@ -344,7 +344,17 @@ class SipFirstVisionModule: NSObject {
       // per-frame glassDetected. The JS pipeline already confirmed the glass
       // stably before entering Step 2, so per-frame gate here causes most
       // frames to return unknown/0.00 even with a glass visibly in frame.
-      if let rect = bestRect {
+      //
+      // Geometric guard: reject rects that are too small, too wide, or landscape-
+      // shaped — these are background objects (doors, clothing) that won the
+      // transparency contest when the glass left frame, not actual glassware.
+      // geoCandidates already enforces h/w ≥ 0.67 (width ≤ height × 1.5), so
+      // any threshold above 0.67 incorrectly rejects valid glass rects. Using
+      // 0.50 blocks true landscape objects while passing all real candidates.
+      let rectIsGlassShaped = bestRect.map { r in
+        r.height > 0.08 && r.height / r.width > 0.50 && r.width < 0.30
+      } ?? false
+      if let rect = bestRect, rectIsGlassShaped {
         let lr = SipFirstVisionModule.detectLiquidLevel(cgImage: cgImage, glassRect: rect)
         hasLiquid       = lr.hasLiquid
         liquidLevelNorm = lr.levelNorm
@@ -555,7 +565,9 @@ class SipFirstVisionModule: NSObject {
     let varScore    = max(0, min(1, stdDevL / 0.10))
 
     // edgeScore: 1.0 when edgeDelta ≥ 0.07 (specular highlights on glass walls).
-    let edgeScore   = max(0, min(1, (edgeDelta + 0.03) / 0.10))
+    // Floored at 0.10 so a backlit glass (centre brighter than edges) cannot zero
+    // the multiplicative product — the signal is weakened, not eliminated.
+    let edgeScore   = max(0.10, min(1, (edgeDelta + 0.03) / 0.10))
 
     // colScore: 1.0 when colStdDev ≥ 0.04 (curved column brightness profile).
     let colScore    = max(0, min(1, colStdDev / 0.04))
