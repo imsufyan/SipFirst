@@ -157,6 +157,7 @@ class SipFirstVisionModule: NSObject {
       var calibInfo: [String] = []
       // Declared here so Stage 2 (after the do/catch block) can access them.
       var bestRect: CGRect? = nil
+      var faceBB:   CGRect? = nil
 
       do {
         try handler.perform([faceReq, handReq, rectReq])
@@ -172,6 +173,8 @@ class SipFirstVisionModule: NSObject {
                     "topLabels": calibInfo])
           return
         }
+
+        faceBB = face.boundingBox
 
         // Vision coords: origin bottom-left, y upward.
         // faceFloor = lowest y of face rect → everything with smaller y is "below face".
@@ -305,7 +308,7 @@ class SipFirstVisionModule: NSObject {
           //   5. colScore  > 0.20    — column profile must be non-flat.
           //   Conditions 4–5 prevent a very high satScore (nearly colourless
           //   object) from masking weak transparency and cylindrical-shape signals.
-          let bgScoreMin: Float = 0.65
+          let bgScoreMin: Float = 0.50
           let scoreGatesPass =
             tr.combined > transparencyMinScore &&
             tr.varScore > varScoreMin          &&
@@ -368,13 +371,26 @@ class SipFirstVisionModule: NSObject {
         calibInfo.append(lr.debug)
       }
 
+      var faceRectOut: Any = NSNull()
+      if let bb = faceBB {
+        faceRectOut = ["x": Double(bb.minX), "y": Double(bb.minY),
+                       "width": Double(bb.width), "height": Double(bb.height)] as [String: Any]
+      }
+      var glassRectOut: Any = NSNull()
+      if let bb = bestRect {
+        glassRectOut = ["x": Double(bb.minX), "y": Double(bb.minY),
+                        "width": Double(bb.width), "height": Double(bb.height)] as [String: Any]
+      }
+
       resolver([
         "faceDetected":    faceDetected,
         "glassDetected":   glassDetected,
         "hasLiquid":       hasLiquid,
         "liquidLevel":     liquidLevel,
         "liquidLevelNorm": liquidLevelNorm,
-        "topLabels":       calibInfo
+        "topLabels":       calibInfo,
+        "faceRect":        faceRectOut,
+        "glassRect":       glassRectOut,
       ])
     }
   }
@@ -820,19 +836,22 @@ class SipFirstVisionModule: NSObject {
       // darker than an empty glass (absorption) with low saturation.
       let avgL = rowL.reduce(0, +) / Float(numRows)
       let avgS = rowS.reduce(0, +) / Float(numRows)
-      // Relaxed: clear water in normal indoor light can have avgL up to ~0.68
-      // and avgS up to ~0.22. Strict conditions caused full glasses to miss this path.
+      // Strict heuristic: an empty glass shows the background through it, which
+      // can mimic low-saturation, moderate-lightness readings. Require water's
+      // characteristic optical fingerprint: darker interior (absorption), truly
+      // achromatic, and high pixel variance from refraction — all three must hold.
       let variance = rowL.map { ($0 - avgL) * ($0 - avgL) }.reduce(0, +) / Float(numRows)
       let likelyFull =
-          avgL < 0.70 &&
-          avgS < 0.25 &&
-          variance > 0.002   // ensures it's not flat empty glass
+          avgL < 0.55 &&     // water absorbs light → darker than empty glass
+          avgS < 0.12 &&     // water is achromatic; reflections raise this
+          variance > 0.010   // refraction creates strong brightness spread
       if likelyFull {
         return LiquidResult(
-          hasLiquid: true, levelNorm: 1.0, level: .full, confidence: 0.40,
+          hasLiquid: true, levelNorm: 0.80, level: .high, confidence: 0.50,
           debug: "noMeniscus(likelyFull)" +
                  " L:\(String(format:"%.2f",avgL))" +
-                 " S:\(String(format:"%.2f",avgS))"
+                 " S:\(String(format:"%.2f",avgS))" +
+                 " var:\(String(format:"%.4f",variance))"
         )
       }
       return LiquidResult(
@@ -883,8 +902,12 @@ class SipFirstVisionModule: NSObject {
       " lvl:\(String(format:"%.2f",levelNorm))" +
       " conf:\(String(format:"%.2f",confidence))"
 
+    // Require both meaningful confidence AND minimum fill level.
+    // confidence > 0.15 was too permissive: a low-contrast empty glass reflection
+    // could score 0.16 and propagate hasLiquid:true to the JS EMA.
+    // levelNorm >= 0.30 rejects glasses that are < 30% filled — insufficient for Step 2.
     return LiquidResult(
-      hasLiquid: confidence > 0.15,
+      hasLiquid: confidence > 0.20 && levelNorm >= 0.30,
       levelNorm: levelNorm,
       level: levelLabel,
       confidence: confidence,

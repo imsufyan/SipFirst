@@ -6,113 +6,126 @@ const { SipFirstVisionModule } = NativeModules;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STABLE_REQUIRED     = 3;     // consecutive gate-passes before step advances
-const MISS_TOLERANCE      = 1;     // consecutive gate-fails allowed before stable drops
+const STABLE_REQUIRED = 4;     // 4 × 500 ms = 2 s of sustained gate-pass before advancing
+const MISS_TOLERANCE = 1;     // consecutive gate-fails absorbed before stable count drops
 const CAPTURE_INTERVAL_MS = 500;   // ms between capture + analysis rounds
 
 // ── Step 2 EMA parameters ────────────────────────────────────────────────────
 //
-// Core insight from log analysis:
-//   The native meniscus detector reports raw values of 0.80–0.88 on only
-//   ~1 in 8 frames. The other 7 frames are low (0.15–0.35) or zero.
-//   Including those low frames in any mean or EMA drags the estimate down.
+// High-pass input filter: EMA only climbs on frames where rawNorm > LEVEL_EMA_MIN.
+// Low/false frames trigger passive decay (0.993/frame) instead of dragging the mean
+// down. Once EMA reaches EMA_GATE, every subsequent frame passes step2Gate and
+// stableCount fills in ~2 s.
 //
-// Fix: high-pass input filter — only update the EMA when raw > MIN_INPUT.
-//   Low/false frames do NOT reset the EMA. Instead the EMA decays slowly
-//   (PASSIVE_DECAY) which handles the "glass put down" case without letting
-//   a single miss frames undo accumulated evidence.
-//
-// Result: EMA stabilises at the TRUE level for high frames (~0.65–0.85)
-//   and decays to zero only after many consecutive low/false frames (~20s).
-//
-// Why no seed dampening: EMA_GATE=0.68 + MISS_TOLERANCE=1 already prevents
-//   half-filled false positives. A dampened seed (×0.70) caused fully-filled
-//   glasses with sparse high readings (1 in 25 frames) to never reach the gate —
-//   the single seed frame set EMA at 0.58 and slow decay did the rest.
+// RAW_FAST_GATE bypass removed: a single reflection spike could push EMA over the
+// gate before enough evidence accumulated. EMA-only gating is more reliable.
 
-const LEVEL_EMA_ALPHA    = 0.50;   // response speed on each high-value update
-const LEVEL_EMA_MIN      = 0.40;   // raw norm must exceed this to update EMA
-const LEVEL_EMA_DECAY    = 0.993;  // passive decay per frame when no update
-const EMA_GATE           = 0.68;   // EMA must reach this to signal "full enough"
-const RAW_FAST_GATE      = 0.85;   // single very-high raw can bypass EMA climb…
-const RAW_FAST_EMA_MIN   = 0.62;   // …but EMA must already show real substance
+const LEVEL_EMA_ALPHA  = 0.50;   // response speed on each high-value update
+const LEVEL_EMA_MIN    = 0.40;   // raw norm must exceed this to update EMA
+const LEVEL_EMA_DECAY  = 0.993;  // passive decay per frame when no update
+const EMA_GATE         = 0.68;   // EMA threshold when current frame has active signal
+// EMA_COAST_GATE prevents a low-fill glass from coasting through stable count on
+// zero-signal frames. A full glass seeds EMA at ~0.80; after one passive decay:
+// 0.80 × 0.993 = 0.794 → still passes. A low-fill glass seeds at ~0.71;
+// 0.71 × 0.993 = 0.705 → fails. So COAST_GATE = 0.78 correctly discriminates.
+const EMA_COAST_GATE   = 0.78;   // EMA threshold when coasting on zero-signal frames
+
+// ── Step 3 parameters ────────────────────────────────────────────────────────
+//
+// Two-phase design:
+//   "drinking"  → run sip state machine; advance to "showEmpty" after MIN_SIPS real sips
+//   "showEmpty" → child lowers glass; wait for smoothLevel < EMPTY_THRESH for EMPTY_FRAMES
+//                 consecutive frames before declaring hydrationComplete
+//
+// Sip validation — duration only (levelDrop removed):
+//   The Step 3 EMA decays constantly (raw=0 most frames), so by the time a sip
+//   is attempted smoothLevel is already near 0, making a ≥0.15 drop impossible.
+//   Duration alone (SIP_MIN_FRAMES × 500ms) is the reliable discriminator.
+//
+// Display level vs smoothLevel:
+//   smoothLevel (decaying EMA) → ONLY for empty detection in showEmpty phase
+//   displayLevel (last rawNorm ≥ 0.15) → shown in UI as "% remaining"
+//   This prevents the UI from showing 0% while the glass is still full.
+//
+// Sipping geometry miss tolerance:
+//   When the glass is near the face during drinking, detection is noisy.
+//   During "sipping" state, geometry misses DON'T reset to idle — they just
+//   continue counting sipping frames until SIPPING_MAX_MISS is exceeded.
+
+const STEP3_EMA_ALPHA      = 0.20;   // temporal smoothing for empty detection
+const STEP3_EMA_SEED       = 0.70;   // initial smooth level on Step 3 entry
+const STEP3_SIP_MIN_FRAMES = 5;      // min frames near mouth (5 × 500ms = 2.5 s)
+const STEP3_EMPTY_THRESH     = 0.30;  // rawNorm below this → glass is empty
+const STEP3_EMPTY_FRAMES     = 4;    // non-consecutive empty frames needed (with spike tolerance)
+const STEP3_EMPTY_SPIKE_TOL  = 2;    // consecutive non-empty frames allowed before resetting count
+const STEP3_MIN_SIPS         = 3;    // min real sips before moving to showEmpty phase
+const STEP3_MISS_TOLERANCE        = 3;   // frames without geometry before resetting (non-sipping)
+const STEP3_SIP_MAX_MISS          = 10;  // max geometry-miss frames allowed DURING sipping
+const STEP3_SIP_NOT_NEAR_MOUTH_MAX = 3;  // consecutive !glassNearMouth detected-frames before ending sip
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type PipelineStep = 1 | 2 | 3;
-export type StepStatus   = "detecting" | "stabilizing" | "stable";
-export type LiquidLevel  = "empty" | "low" | "medium" | "high" | "full" | "unknown";
+export type StepStatus = "detecting" | "stabilizing" | "stable";
+export type LiquidLevel = "empty" | "low" | "medium" | "high" | "full" | "unknown";
+export type DrinkState = "idle" | "approaching" | "nearMouth" | "sipping" | "cooldown";
+export type Step3Phase = "drinking" | "showEmpty";
 
 export interface PipelineState {
-  activeStep:           PipelineStep;
-  stepStatus:           StepStatus;
-  faceDetected:         boolean;
-  glassDetected:        boolean;
-  hasLiquid:            boolean;
-  liquidLevel:          LiquidLevel;
-  liquidLevelNorm:      number;    // EMA value, 0.0 → 1.0
+  activeStep: PipelineStep;
+  stepStatus: StepStatus;
+  faceDetected: boolean;
+  glassDetected: boolean;
+  hasLiquid: boolean;
+  liquidLevel: LiquidLevel;
+  liquidLevelNorm: number;
   liquidAboveThreshold: boolean;
+  drinkDetected: boolean;
+  drinkState: DrinkState;
+  step3Phase: Step3Phase;
+  hydrationComplete: boolean;
+  sipCount: number;
+}
+
+interface NativeRect {
+  x: number; y: number; width: number; height: number;
 }
 
 interface NativeResult {
-  faceDetected:    boolean;
-  glassDetected:   boolean;
-  hasLiquid:       boolean;
-  liquidLevel:     string;
+  faceDetected: boolean;
+  glassDetected: boolean;
+  hasLiquid: boolean;
+  liquidLevel: string;
   liquidLevelNorm: number;
-  topLabels:       string[];
+  topLabels: string[];
+  faceRect?: NativeRect;
+  glassRect?: NativeRect;
 }
 
 // ─── Step 2 helpers ───────────────────────────────────────────────────────────
 
-/**
- * EMA with high-pass input filter + passive decay.
- *
- * Why this design:
- *   Old mean/EMA: frame [0.88, 0.00, 0.00, 0.00, 0.00] → mean = 0.18 (fails)
- *   This EMA:     same frames → EMA stays at 0.88 * decay^4 ≈ 0.85 (passes)
- *
- * The EMA only CLIMBS on frames where raw > LEVEL_EMA_MIN (genuine signal).
- * It DECAYS slowly on all other frames. It never takes a sudden negative hit.
- */
 function updateLevelEma(ema: number, rawHasLiquid: boolean, rawNorm: number): number {
   if (rawHasLiquid && rawNorm >= LEVEL_EMA_MIN) {
-    // Active update — incorporate a genuine high-level reading.
-    if (ema < 0) return rawNorm;                                         // first seed
+    if (ema < 0) return rawNorm;
     return LEVEL_EMA_ALPHA * rawNorm + (1 - LEVEL_EMA_ALPHA) * ema;
   }
-  // Passive decay — no high reading this frame.
-  // Decays to zero over ~20 seconds of silence, handling "glass put down".
   return ema < 0 ? -1 : ema * LEVEL_EMA_DECAY;
 }
 
-/**
- * Step 2 gate — EMA-only, no vote.
- *
- * Why no vote:
- *   The vote tracks raw hasLiquid which is false on ~65% of frames.
- *   Requiring majority vote means the gate almost never opens even when
- *   EMA has correctly climbed to 0.70–0.79 (as seen repeatedly in logs).
- *   The EMA itself IS the multi-frame evidence — a separate vote is redundant.
- *
- * Primary:     EMA ≥ 0.62  (sustained evidence of high fill)
- * Supplemental: raw ≥ 0.82 AND EMA ≥ 0.45  (very high single frame + climbing EMA)
- */
 function step2Gate(ema: number, rawHasLiquid: boolean, rawNorm: number): boolean {
-  if (ema >= EMA_GATE) return true;
-  if (rawHasLiquid && rawNorm >= RAW_FAST_GATE && ema >= RAW_FAST_EMA_MIN) return true;
-  return false;
+  // When the current frame carries an active signal, use the standard gate.
+  if (rawHasLiquid && rawNorm >= LEVEL_EMA_MIN) return ema >= EMA_GATE;
+  // When the current frame has no signal (raw=0 / hasLiquid=false), require a
+  // higher EMA to prevent coasting. A full glass seeds EMA ~0.80 and its decay
+  // stays above 0.78 for several frames. A low-fill glass that spikes to 0.73
+  // decays to 0.725 on the next silent frame — below EMA_COAST_GATE.
+  return ema >= EMA_COAST_GATE;
 }
 
-/**
- * Stable counter with miss hysteresis.
- * MISS_TOLERANCE consecutive fails are absorbed before stable count drops by 1.
- * Count never zeroes from a single fail — momentum is preserved.
- */
 function updateStable(
-  pass:        boolean,
-  count:       number,
-  missStreak:  { current: number },
+  pass: boolean,
+  count: number,
+  missStreak: { current: number },
 ): number {
   if (pass) {
     missStreak.current = 0;
@@ -123,7 +136,7 @@ function updateStable(
     missStreak.current = 0;
     return Math.max(0, count - 1);
   }
-  return count;   // within tolerance — hold position
+  return count;
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -134,53 +147,76 @@ export function useDetectionPipeline(
 ): { state: PipelineState; reset: () => void } {
 
   const [state, setState] = useState<PipelineState>({
-    activeStep:           1,
-    stepStatus:           "detecting",
-    faceDetected:         false,
-    glassDetected:        false,
-    hasLiquid:            false,
-    liquidLevel:          "unknown",
-    liquidLevelNorm:      0,
+    activeStep: 1,
+    stepStatus: "detecting",
+    faceDetected: false,
+    glassDetected: false,
+    hasLiquid: false,
+    liquidLevel: "unknown",
+    liquidLevelNorm: 0,
     liquidAboveThreshold: false,
+    drinkDetected: false,
+    drinkState: "idle",
+    step3Phase: "drinking",
+    hydrationComplete: false,
+    sipCount: 0,
   });
 
-  const activeStep      = useRef<PipelineStep>(1);
-  const stableCount     = useRef(0);
-  const missStreak      = useRef(0);
-  const stepTriggered   = useRef(false);
-  const step3Logged     = useRef(false);
-  const isCapturing     = useRef(false);
-  const isMounted       = useRef(true);
-  const onCompleteRef   = useRef(onComplete);
+  const activeStep = useRef<PipelineStep>(1);
+  const stableCount = useRef(0);
+  const missStreak = useRef(0);
+  const stepTriggered = useRef(false);
+  const isCapturing = useRef(false);
+  const isMounted = useRef(true);
+  const onCompleteRef = useRef(onComplete);
   onCompleteRef.current = onComplete;
 
-  // Step 2 EMA state — -1 means uninitialised (no readings yet)
-  const levelEma = useRef<number>(-1);
+  const levelEma = useRef<number>(-1);   // Step 2 EMA; -1 = uninitialised
+
+  // Step 3 refs
+  const drinkStateMachine = useRef<DrinkState>("idle");
+  const drinkStateFrames = useRef(0);
+  const sipCount = useRef(0);
+  const hadLiquidRef = useRef(false);
+  const emptyFrameCount = useRef(0);
+  const prevGlassY = useRef<number | null>(null);
+  const step3LevelEma = useRef<number>(-1);
+  const levelAtSipStart = useRef<number>(0);
+  const sippingFrames        = useRef(0);
+  const sipNotNearMouthCount = useRef(0);
+  const emptySpike           = useRef(0);   // consecutive non-empty raw frames during showEmpty
+  const step3Phase    = useRef<Step3Phase>("drinking");
+  const geometryMiss  = useRef(0);
+  const displayLevel  = useRef<number>(STEP3_EMA_SEED);  // last known rawNorm ≥ 0.15 for UI
 
   const advanceToStep = useCallback((next: PipelineStep) => {
-    activeStep.current    = next;
-    stableCount.current   = 0;
-    missStreak.current    = 0;
+    activeStep.current = next;
+    stableCount.current = 0;
+    missStreak.current = 0;
     stepTriggered.current = false;
-    levelEma.current      = -1;
+    levelEma.current = -1;
+    if (next === 3) {
+      hadLiquidRef.current = true;
+      emptyFrameCount.current = 0;
+      drinkStateMachine.current = "idle";
+      drinkStateFrames.current = 0;
+      sipCount.current = 0;
+      prevGlassY.current = null;
+      step3LevelEma.current = STEP3_EMA_SEED;
+      levelAtSipStart.current = STEP3_EMA_SEED;
+      sippingFrames.current        = 0;
+      sipNotNearMouthCount.current = 0;
+      emptySpike.current           = 0;
+      step3Phase.current           = "drinking";
+      geometryMiss.current         = 0;
+      displayLevel.current         = STEP3_EMA_SEED;
+    }
   }, []);
 
   const runPipeline = useCallback(async () => {
     if (isCapturing.current || !isMounted.current) return;
 
     const step = activeStep.current;
-
-    // ── Step 3 stub ──────────────────────────────────────────────────────────
-    if (step === 3) {
-      if (!step3Logged.current) {
-        step3Logged.current = true;
-        console.log("[SipFirst] STEP 3 START");
-        console.log("[SipFirst] Detecting user drinking water...");
-        console.log("[SipFirst] Coming next...");
-      }
-      return;
-    }
-
     const camera = cameraRef.current;
     if (!camera) return;
 
@@ -194,86 +230,264 @@ export function useDetectionPipeline(
 
       const rawNorm = result.liquidLevelNorm ?? 0;
 
+      // ── Step 3: drink + hydration detection ─────────────────────────────────
+      if (step === 3) {
+
+        // smoothLevel: decaying EMA — ONLY used for empty detection in showEmpty phase.
+        // It decays naturally when raw=0 (typical while glass is being held/tilted),
+        // eventually dropping below STEP3_EMPTY_THRESH after sustained absence.
+        const prevSmooth = step3LevelEma.current < 0 ? STEP3_EMA_SEED : step3LevelEma.current;
+        step3LevelEma.current = STEP3_EMA_ALPHA * rawNorm + (1 - STEP3_EMA_ALPHA) * prevSmooth;
+        const smoothLevel = step3LevelEma.current;
+
+        // displayLevel: last known real reading — shown in UI as "% remaining".
+        // Only updates when native returns a plausible level reading (rawNorm ≥ 0.15).
+        // Never decays; holds the last real value when glass is not detected.
+        if (rawNorm >= 0.15) displayLevel.current = rawNorm;
+
+        // ── Phase-separated: sip detection (drinking) vs empty check (showEmpty) ─
+        let drinkDetected = false;
+
+        if (step3Phase.current === "drinking") {
+          // ── Sip state machine ───────────────────────────────────────────────
+          const faceRect  = result.faceRect  ?? null;
+          const glassRect = result.glassRect ?? null;
+
+          if (faceRect && glassRect) {
+            geometryMiss.current = 0;
+
+            const glassTopY      = glassRect.y + glassRect.height;
+            const prevY          = prevGlassY.current;
+            const glassMovingUp  = prevY !== null && (glassTopY - prevY) > 0.025;
+            prevGlassY.current   = glassTopY;
+            const glassNearMouth = glassTopY >= faceRect.y - 0.07;
+
+            const prev = drinkStateMachine.current;
+            let   next = prev;
+            drinkStateFrames.current++;
+
+            switch (prev) {
+              case "idle":
+                if (glassNearMouth || glassMovingUp) {
+                  next = "approaching";
+                  drinkStateFrames.current = 0;
+                }
+                break;
+              case "approaching":
+                if (glassNearMouth) {
+                  next = "nearMouth";
+                  drinkStateFrames.current = 0;
+                } else if (drinkStateFrames.current > 10) {
+                  next = "idle";
+                }
+                break;
+              case "nearMouth":
+                if (glassNearMouth) {
+                  next = "sipping";
+                  sippingFrames.current = 1;
+                  sipNotNearMouthCount.current = 0;
+                } else {
+                  sipNotNearMouthCount.current++;
+                  if (sipNotNearMouthCount.current >= 2) {
+                    next = "idle";
+                    sipNotNearMouthCount.current = 0;
+                  }
+                }
+                break;
+              case "sipping":
+                sippingFrames.current++;
+                if (glassNearMouth) {
+                  sipNotNearMouthCount.current = 0;
+                } else {
+                  sipNotNearMouthCount.current++;
+                  if (sipNotNearMouthCount.current >= STEP3_SIP_NOT_NEAR_MOUTH_MAX) {
+                    const realSip = sippingFrames.current >= STEP3_SIP_MIN_FRAMES;
+                    if (realSip) {
+                      sipCount.current++;
+                      drinkDetected = true;
+                      next = "cooldown";
+                      drinkStateFrames.current = 0;
+                    } else {
+                      next = "idle";
+                    }
+                    sippingFrames.current = 0;
+                    sipNotNearMouthCount.current = 0;
+                  }
+                }
+                break;
+              case "cooldown":
+                if (drinkStateFrames.current >= 4) {
+                  next = "idle";
+                }
+                break;
+            }
+            drinkStateMachine.current = next;
+
+          } else {
+            geometryMiss.current++;
+
+            if (drinkStateMachine.current === "sipping") {
+              sippingFrames.current++;
+              if (geometryMiss.current > STEP3_SIP_MAX_MISS) {
+                const realSip = sippingFrames.current >= STEP3_SIP_MIN_FRAMES;
+                if (realSip) {
+                  sipCount.current++;
+                  drinkDetected = true;
+                  drinkStateMachine.current = "cooldown";
+                  drinkStateFrames.current  = 0;
+                } else {
+                  drinkStateMachine.current = "idle";
+                }
+                sippingFrames.current = 0;
+                geometryMiss.current  = 0;
+              }
+            } else if (geometryMiss.current > STEP3_MISS_TOLERANCE) {
+              prevGlassY.current = null;
+              if (drinkStateMachine.current !== "cooldown") {
+                drinkStateMachine.current = "idle";
+              }
+            }
+          }
+
+          // Transition to showEmpty after enough sips
+          if (sipCount.current >= STEP3_MIN_SIPS) {
+            step3Phase.current      = "showEmpty";
+            emptyFrameCount.current = 0;
+            emptySpike.current      = 0;
+            drinkStateMachine.current = "idle";
+            console.log(`[SipFirst] STEP 3 → showEmpty (sips:${sipCount.current})`);
+          }
+
+        } else {
+          // ── showEmpty: look for empty glass — sip machine is NOT running ────
+          // Use rawNorm directly; smoothLevel EMA is too easily bumped by noise.
+          // Spike tolerance allows isolated false positives without full counter reset.
+          if (rawNorm < STEP3_EMPTY_THRESH) {
+            emptyFrameCount.current++;
+            emptySpike.current = 0;
+          } else {
+            emptySpike.current++;
+            if (emptySpike.current > STEP3_EMPTY_SPIKE_TOL) {
+              emptyFrameCount.current = 0;
+              emptySpike.current      = 0;
+            }
+          }
+        }
+
+        const hydrationComplete = step3Phase.current === "showEmpty"
+          && hadLiquidRef.current
+          && emptyFrameCount.current >= STEP3_EMPTY_FRAMES;
+
+        console.log(
+          `[SipFirst] STEP3 state:${drinkStateMachine.current}` +
+          ` phase:${step3Phase.current}` +
+          ` sips:${sipCount.current}/${STEP3_MIN_SIPS}` +
+          ` smooth:${smoothLevel.toFixed(2)}` +
+          ` display:${displayLevel.current.toFixed(2)}` +
+          ` raw:${rawNorm.toFixed(2)}` +
+          ` sipFrm:${sippingFrames.current}` +
+          ` nnm:${sipNotNearMouthCount.current}` +
+          ` miss:${geometryMiss.current}` +
+          ` empty:${emptyFrameCount.current}/${STEP3_EMPTY_FRAMES}` +
+          ` done:${hydrationComplete}`,
+        );
+
+        setState(prev => ({
+          ...prev,
+          activeStep:        3,
+          stepStatus:        hydrationComplete ? "stable" : "detecting",
+          faceDetected:      result.faceDetected,
+          glassDetected:     result.glassDetected,
+          hasLiquid:         result.hasLiquid,
+          liquidLevelNorm:   displayLevel.current,   // actual level, not decaying EMA
+          drinkDetected,
+          drinkState:        drinkStateMachine.current,
+          step3Phase:        step3Phase.current,
+          hydrationComplete,
+          sipCount:          sipCount.current,
+        }));
+
+        if (hydrationComplete && !stepTriggered.current) {
+          stepTriggered.current = true;
+          onCompleteRef.current();
+        }
+        return;
+      }
+
       // ── Step 2: high-pass EMA ───────────────────────────────────────────────
-      let effectiveHasLiquid  = result.hasLiquid;
+      let effectiveHasLiquid = result.hasLiquid;
       let effectiveLiquidNorm = rawNorm;
       let liquidAboveThreshold = false;
 
       if (step === 2) {
-        levelEma.current    = updateLevelEma(levelEma.current, result.hasLiquid, rawNorm);
-        const ema           = levelEma.current < 0 ? 0 : levelEma.current;
+        levelEma.current = updateLevelEma(levelEma.current, result.hasLiquid, rawNorm);
+        const ema = levelEma.current < 0 ? 0 : levelEma.current;
         effectiveLiquidNorm = ema;
-        effectiveHasLiquid  = ema > 0;
+        effectiveHasLiquid = ema > 0;
         liquidAboveThreshold = step2Gate(ema, result.hasLiquid, rawNorm);
       }
 
       // ── Step 1 signal ───────────────────────────────────────────────────────
       const signalPass = step === 1 ? result.glassDetected : liquidAboveThreshold;
 
-      // ── Stability counter ───────────────────────────────────────────────────
       stableCount.current = updateStable(signalPass, stableCount.current, missStreak);
 
       const stepStatus: StepStatus =
         stableCount.current >= STABLE_REQUIRED ? "stable"
-        : stableCount.current > 0              ? "stabilizing"
-        : "detecting";
+          : stableCount.current > 0 ? "stabilizing"
+            : "detecting";
 
       // ── Logging ─────────────────────────────────────────────────────────────
       if (step === 1) {
-        console.log("[SipFirst] STEP 1 START");
-        console.log(`[SipFirst] Glass detected: ${result.glassDetected}`);
         console.log(
-          `[SipFirst] step=1 face=${result.faceDetected}` +
+          `[SipFirst] STEP1 face=${result.faceDetected}` +
+          ` glass=${result.glassDetected}` +
           ` stable=${stableCount.current}/${STABLE_REQUIRED} status=${stepStatus}`,
         );
       } else {
         const emaDisplay = (levelEma.current < 0 ? 0 : levelEma.current).toFixed(2);
-        console.log("[SipFirst] STEP 2 START");
         console.log(
-          `[SipFirst] Liquid detected: ${result.hasLiquid}` +
-          ` raw:${rawNorm.toFixed(2)} ema:${emaDisplay}`,
-        );
-        console.log(
-          `[SipFirst] gate=${liquidAboveThreshold}` +
+          `[SipFirst] STEP2 hasLiquid=${result.hasLiquid}` +
+          ` raw:${rawNorm.toFixed(2)} ema:${emaDisplay}` +
+          ` gate=${liquidAboveThreshold}` +
           ` stable=${stableCount.current}/${STABLE_REQUIRED}` +
           ` miss=${missStreak.current}/${MISS_TOLERANCE}` +
           ` status=${stepStatus}`,
         );
-        if (!signalPass) {
-          console.log(
-            `[SipFirst] STEP 2 FAILED → raw:${rawNorm.toFixed(2)} ema:${emaDisplay}`,
-          );
-        }
       }
 
-      setState({
-        activeStep:           step,
+      setState(prev => ({
+        ...prev,
+        activeStep: step,
         stepStatus,
-        faceDetected:         result.faceDetected,
-        glassDetected:        result.glassDetected,
-        hasLiquid:            effectiveHasLiquid,
-        liquidLevel:          (result.liquidLevel as LiquidLevel) ?? "unknown",
-        liquidLevelNorm:      effectiveLiquidNorm,
+        faceDetected: result.faceDetected,
+        glassDetected: result.glassDetected,
+        hasLiquid: effectiveHasLiquid,
+        liquidLevel: (result.liquidLevel as LiquidLevel) ?? "unknown",
+        liquidLevelNorm: effectiveLiquidNorm,
         liquidAboveThreshold,
-      });
+        drinkDetected: false,
+        drinkState: "idle",
+        step3Phase: "drinking",
+        hydrationComplete: false,
+        sipCount: 0,
+      }));
 
       // ── Step transitions ─────────────────────────────────────────────────────
       if (stepStatus === "stable" && !stepTriggered.current) {
         stepTriggered.current = true;
-
         if (step === 1) {
-          console.log("[SipFirst] ✓ Step 1 complete — advancing to Step 2");
+          console.log("[SipFirst] ✓ Step 1 complete → Step 2");
           advanceToStep(2);
         } else {
-          console.log("[SipFirst] STEP 2 PASSED → liquid OK → moving to Step 3");
-          console.log("[SipFirst] Step 3 – checking user drinking water – coming next");
+          console.log("[SipFirst] ✓ Step 2 complete → Step 3");
           advanceToStep(3);
           setState(prev => ({ ...prev, activeStep: 3, stepStatus: "detecting" }));
         }
       }
 
     } catch {
-      // Skip frame on any capture or analysis error.
+      // Skip frame on capture or analysis error
     } finally {
       isCapturing.current = false;
     }
@@ -289,21 +503,41 @@ export function useDetectionPipeline(
   }, [runPipeline]);
 
   const reset = useCallback(() => {
-    activeStep.current    = 1;
-    stableCount.current   = 0;
-    missStreak.current    = 0;
+    activeStep.current = 1;
+    stableCount.current = 0;
+    missStreak.current = 0;
     stepTriggered.current = false;
-    step3Logged.current   = false;
-    levelEma.current      = -1;
+
+    levelEma.current = -1;
+    drinkStateMachine.current = "idle";
+    drinkStateFrames.current = 0;
+    sipCount.current = 0;
+    hadLiquidRef.current = false;
+    emptyFrameCount.current = 0;
+    prevGlassY.current = null;
+    step3LevelEma.current = -1;
+    levelAtSipStart.current = 0;
+    sippingFrames.current        = 0;
+    sipNotNearMouthCount.current = 0;
+    emptySpike.current           = 0;
+    step3Phase.current           = "drinking";
+    geometryMiss.current         = 0;
+    displayLevel.current         = 0;
+
     setState({
-      activeStep:           1,
-      stepStatus:           "detecting",
-      faceDetected:         false,
-      glassDetected:        false,
-      hasLiquid:            false,
-      liquidLevel:          "unknown",
-      liquidLevelNorm:      0,
+      activeStep: 1,
+      stepStatus: "detecting",
+      faceDetected: false,
+      glassDetected: false,
+      hasLiquid: false,
+      liquidLevel: "unknown",
+      liquidLevelNorm: 0,
       liquidAboveThreshold: false,
+      drinkDetected: false,
+      drinkState: "idle",
+      step3Phase: "drinking",
+      hydrationComplete: false,
+      sipCount: 0,
     });
   }, []);
 
