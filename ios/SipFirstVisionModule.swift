@@ -117,7 +117,7 @@ class SipFirstVisionModule: NSObject {
 
       // Per-score minimums — prevent a single inflated signal from carrying
       // an otherwise weak candidate over the combined threshold.
-      let varScoreMin:  Float = 0.25   // background must visibly show through
+      let varScoreMin:  Float = 0.18   // background must visibly show through (was 0.25)
       let colScoreMin:  Float = 0.20   // column brightness profile must be non-flat
 
       // ── Load image ──────────────────────────────────────────────────────────
@@ -308,7 +308,7 @@ class SipFirstVisionModule: NSObject {
           //   5. colScore  > 0.20    — column profile must be non-flat.
           //   Conditions 4–5 prevent a very high satScore (nearly colourless
           //   object) from masking weak transparency and cylindrical-shape signals.
-          let bgScoreMin: Float = 0.50
+          let bgScoreMin: Float = 0.35   // was 0.50 — ring/interior match within ~12% lightness
           let scoreGatesPass =
             tr.combined > transparencyMinScore &&
             tr.varScore > varScoreMin          &&
@@ -322,8 +322,9 @@ class SipFirstVisionModule: NSObject {
             " hand:\(handBelowFace)" +
             " scoreOK:\(scoreGatesPass)" +
             " (prod:\(String(format:"%.4f",tr.combined))>0.08" +
-            " var:\(String(format:"%.2f",tr.varScore))>0.25" +
-            " col:\(String(format:"%.2f",tr.colScore))>0.20)" +
+            " var:\(String(format:"%.2f",tr.varScore))>0.18" +
+            " col:\(String(format:"%.2f",tr.colScore))>0.20" +
+            " bg:\(String(format:"%.2f",tr.bgScore))>0.35)" +
             " → glass:\(glassDetected)"
           )
 
@@ -821,12 +822,38 @@ class SipFirstVisionModule: NSObject {
     for i in 0..<(numRows - 1) { deriv[i] = smooth[i + 1] - smooth[i] }
 
     // ── Step 4: locate meniscus candidate ────────────────────────────────────
-    let skip = max(2, Int(Float(numRows) * skipFrac))  // skipFrac is Float — types match
+    //
+    // Two-pass selection biased toward the topmost significant transition.
+    //
+    // Why: a full glass has its real meniscus near the top (rows 5–15 of 60),
+    // but mid-glass refraction patterns, wall logos, or background lines
+    // through the glass can produce derivatives just as strong (sometimes stronger)
+    // than the meniscus itself. Picking the global max-|Δ| row often returned
+    // a mid-glass artefact, reading levelNorm ≈ 0.45 for a clearly full glass.
+    //
+    // Fix: find the global max first, then scan from the TOP and pick the first
+    // row whose |Δ| is at least topBias × maxAbsDeriv. This prefers the meniscus
+    // when both the meniscus and a mid-glass artefact are present, and falls
+    // back to the global max when only one transition exists.
+    let skip    = max(2, Int(Float(numRows) * skipFrac))
+    let topBias: Float = 0.60   // accept rows whose deriv ≥ 60 % of global max
+
+    var globalMaxAbsDeriv: Float = 0
+    for i in skip..<(numRows - 1 - skip) {
+      let a = abs(deriv[i])
+      if a > globalMaxAbsDeriv { globalMaxAbsDeriv = a }
+    }
+
+    let derivCut       = max(globalMaxAbsDeriv * topBias, noiseFloor)
     var meniscusRow    = -1
     var maxAbsDeriv: Float = 0
     for i in skip..<(numRows - 1 - skip) {
       let a = abs(deriv[i])
-      if a > maxAbsDeriv { maxAbsDeriv = a; meniscusRow = i }
+      if a >= derivCut {
+        meniscusRow = i
+        maxAbsDeriv = a
+        break
+      }
     }
 
     // ── Step 5: validate — or fall back for a fully-filled glass ─────────────

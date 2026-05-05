@@ -253,13 +253,18 @@ private extension ScreenTimeManager {
       if let localizedName = application.localizedDisplayName, !localizedName.isEmpty {
         return localizedName
       }
-      if let bundleIdentifier = application.bundleIdentifier, !bundleIdentifier.isEmpty {
-        return bundleIdentifier
+      if let bundleId = application.bundleIdentifier, !bundleId.isEmpty {
+        // Extract last bundle component and split camelCase: "com.acme.myApp" → "My App"
+        let lastComponent = bundleId.split(separator: ".").last.map(String.init) ?? bundleId
+        let spaced = lastComponent.replacingOccurrences(of: "([A-Z])", with: " $1", options: .regularExpression)
+          .trimmingCharacters(in: .whitespaces)
+        if !spaced.isEmpty {
+          return spaced.prefix(1).uppercased() + spaced.dropFirst()
+        }
+        return bundleId
       }
     }
-
-    let tokenSuffix = String(tokenId(token).suffix(6))
-    return "Managed App \(index + 1) (\(tokenSuffix))"
+    return "App \(index + 1)"
   }
 
   func applyShieldsFromStoredSelection() {

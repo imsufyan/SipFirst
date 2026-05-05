@@ -6,29 +6,31 @@ const { SipFirstVisionModule } = NativeModules;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STABLE_REQUIRED = 4;     // 4 × 500 ms = 2 s of sustained gate-pass before advancing
-const MISS_TOLERANCE = 1;     // consecutive gate-fails absorbed before stable count drops
+const STABLE_REQUIRED = 3;     // 3 × 500 ms = 1.5 s of sustained gate-pass (was 4)
+const MISS_TOLERANCE = 3;      // absorb up to 3 consecutive gate-fails before decrementing (was 1)
 const CAPTURE_INTERVAL_MS = 500;   // ms between capture + analysis rounds
 
 // ── Step 2 EMA parameters ────────────────────────────────────────────────────
 //
 // High-pass input filter: EMA only climbs on frames where rawNorm > LEVEL_EMA_MIN.
-// Low/false frames trigger passive decay (0.993/frame) instead of dragging the mean
-// down. Once EMA reaches EMA_GATE, every subsequent frame passes step2Gate and
-// stableCount fills in ~2 s.
+// Low/false frames trigger passive decay instead of dragging the mean down.
 //
-// RAW_FAST_GATE bypass removed: a single reflection spike could push EMA over the
-// gate before enough evidence accumulated. EMA-only gating is more reliable.
+// Key behaviours:
+//   • Jump-start: if EMA has decayed below 0.50 and a strong signal arrives
+//     (rawNorm ≥ 0.70), we seed EMA directly to rawNorm instead of blending.
+//     Prevents the slow crawl from ~0.36 → 0.68 taking 10+ frames.
+//   • Slower decay (0.997 vs 0.993): EMA holds above coast gate for ~4 no-signal
+//     frames instead of ~2, absorbing the typical 2–3 frame detection gap.
+//   • Lower coast gate (0.72 vs 0.78): once EMA reaches ~0.80 on a strong signal,
+//     it can coast through 3-4 missed frames and still pass.
 
 const LEVEL_EMA_ALPHA  = 0.50;   // response speed on each high-value update
 const LEVEL_EMA_MIN    = 0.40;   // raw norm must exceed this to update EMA
-const LEVEL_EMA_DECAY  = 0.993;  // passive decay per frame when no update
+const LEVEL_EMA_DECAY  = 0.997;  // passive decay per frame when no update (was 0.993)
 const EMA_GATE         = 0.68;   // EMA threshold when current frame has active signal
-// EMA_COAST_GATE prevents a low-fill glass from coasting through stable count on
-// zero-signal frames. A full glass seeds EMA at ~0.80; after one passive decay:
-// 0.80 × 0.993 = 0.794 → still passes. A low-fill glass seeds at ~0.71;
-// 0.71 × 0.993 = 0.705 → fails. So COAST_GATE = 0.78 correctly discriminates.
-const EMA_COAST_GATE   = 0.78;   // EMA threshold when coasting on zero-signal frames
+const EMA_COAST_GATE   = 0.72;   // EMA threshold when coasting on zero-signal frames (was 0.78)
+const EMA_JUMP_START_THRESH = 0.50;  // if EMA drops below this, seed directly on strong signal
+const EMA_JUMP_START_RAW    = 0.70;  // minimum raw to trigger jump-start
 
 // ── Step 3 parameters ────────────────────────────────────────────────────────
 //
@@ -59,9 +61,10 @@ const STEP3_EMPTY_THRESH     = 0.30;  // rawNorm below this → glass is empty
 const STEP3_EMPTY_FRAMES     = 4;    // non-consecutive empty frames needed (with spike tolerance)
 const STEP3_EMPTY_SPIKE_TOL  = 2;    // consecutive non-empty frames allowed before resetting count
 const STEP3_MIN_SIPS         = 3;    // min real sips before moving to showEmpty phase
-const STEP3_MISS_TOLERANCE        = 3;   // frames without geometry before resetting (non-sipping)
-const STEP3_SIP_MAX_MISS          = 10;  // max geometry-miss frames allowed DURING sipping
-const STEP3_SIP_NOT_NEAR_MOUTH_MAX = 3;  // consecutive !glassNearMouth detected-frames before ending sip
+const STEP3_MISS_TOLERANCE         = 3;   // frames without geometry before resetting (non-sipping)
+const STEP3_SIP_MAX_MISS           = 10;  // max geometry-miss frames allowed DURING sipping
+const STEP3_SIP_NOT_NEAR_MOUTH_MAX = 3;   // consecutive !glassNearMouth detected-frames before ending sip
+const STEP3_SIP_MAX_FRAMES         = 16;  // 8 s hard cap; auto-counts sip if nnm oscillation stalls exit
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -107,6 +110,9 @@ interface NativeResult {
 function updateLevelEma(ema: number, rawHasLiquid: boolean, rawNorm: number): number {
   if (rawHasLiquid && rawNorm >= LEVEL_EMA_MIN) {
     if (ema < 0) return rawNorm;
+    // Jump-start: if EMA has decayed far below the gate and a strong signal arrives,
+    // seed directly rather than blending — prevents a 10+ frame crawl back up.
+    if (ema < EMA_JUMP_START_THRESH && rawNorm >= EMA_JUMP_START_RAW) return rawNorm;
     return LEVEL_EMA_ALPHA * rawNorm + (1 - LEVEL_EMA_ALPHA) * ema;
   }
   return ema < 0 ? -1 : ema * LEVEL_EMA_DECAY;
@@ -286,6 +292,8 @@ export function useDetectionPipeline(
                   next = "sipping";
                   sippingFrames.current = 1;
                   sipNotNearMouthCount.current = 0;
+                  // Capture displayLevel at sip start so we can detect a drop
+                  levelAtSipStart.current = displayLevel.current;
                 } else {
                   sipNotNearMouthCount.current++;
                   if (sipNotNearMouthCount.current >= 2) {
@@ -313,6 +321,32 @@ export function useDetectionPipeline(
                     sippingFrames.current = 0;
                     sipNotNearMouthCount.current = 0;
                   }
+                }
+                // Fast-path: if displayLevel has dropped meaningfully since the sip
+                // started (≥ 0.20) and we've been sipping for at least 3 frames
+                // (1.5 s of evidence), count the sip immediately. This handles the
+                // common case where the child lowers the glass after a successful
+                // sip but glassNearMouth keeps firing true (preventing nnm exit).
+                if (
+                  next === "sipping" &&
+                  sippingFrames.current >= 3 &&
+                  levelAtSipStart.current - displayLevel.current >= 0.20
+                ) {
+                  sipCount.current++;
+                  drinkDetected = true;
+                  next = "cooldown";
+                  drinkStateFrames.current = 0;
+                  sippingFrames.current = 0;
+                  sipNotNearMouthCount.current = 0;
+                }
+                // Hard cap: if nnm oscillation stalls a clean exit, auto-count after 8 s
+                if (next === "sipping" && sippingFrames.current >= STEP3_SIP_MAX_FRAMES) {
+                  sipCount.current++;
+                  drinkDetected = true;
+                  next = "cooldown";
+                  drinkStateFrames.current = 0;
+                  sippingFrames.current = 0;
+                  sipNotNearMouthCount.current = 0;
                 }
                 break;
               case "cooldown":
